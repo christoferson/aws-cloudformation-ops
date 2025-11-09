@@ -1,0 +1,660 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Tutorial: EC2 instance with Launch Template and automated start/stop schedule (Weekdays 9AM-7PM) - SSM Session Manager only'
+
+Parameters:
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64'
+    Description: 'Latest Amazon Linux 2023 AMI ID from SSM Parameter Store'
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+    Description: 'EC2 instance type'
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: 'VPC ID where the instance will be launched'
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: 'Subnet ID where the instance will be launched (private subnet recommended)'
+
+  VolumeSize:
+    Type: Number
+    Default: 20
+    MinValue: 8
+    MaxValue: 100
+    Description: 'EBS volume size in GB'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Network Configuration'
+        Parameters:
+          - VpcId
+          - SubnetId
+      - Label:
+          default: 'Instance Configuration'
+        Parameters:
+          - InstanceType
+          - LatestAmiId
+          - VolumeSize
+
+Resources:
+  # IAM Role for EC2 Instance (SSM Session Manager)
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-EC2-Role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore'
+        - 'arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-EC2-Role'
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-EC2-Profile'
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # Security Group - No inbound rules, SSM only
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-SG'
+      GroupDescription: 'Security group for scheduled EC2 instance - SSM access only, no SSH'
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTPS for SSM, CloudWatch, and package updates'
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTP for package updates'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-SG'
+
+  # Security Group for VPC Endpoints
+  VPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-VPCEndpoint-SG'
+      GroupDescription: 'Security group for SSM VPC endpoints'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+          Description: 'HTTPS from EC2 instances'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-VPCEndpoint-SG'
+
+  # VPC Endpoints for SSM (recommended for private subnets)
+  SSMEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  SSMMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  EC2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  # Launch Template
+  EC2LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-LaunchTemplate'
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref EC2SecurityGroup
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref VolumeSize
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+              Iops: 3000
+              Throughput: 125
+        MetadataOptions:
+          HttpTokens: required  # Enforce IMDSv2
+          HttpPutResponseHopLimit: 1
+          HttpEndpoint: enabled
+          InstanceMetadataTags: enabled
+        Monitoring:
+          Enabled: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -e
+
+            # Log all output
+            exec > >(tee /var/log/user-data.log)
+            exec 2>&1
+
+            echo "Starting user data script at $(date)"
+
+            # Update system
+            dnf update -y
+
+            # Install CloudWatch agent
+            dnf install -y amazon-cloudwatch-agent
+
+            # Ensure SSM agent is running (pre-installed on AL2023)
+            systemctl enable amazon-ssm-agent
+            systemctl start amazon-ssm-agent
+            systemctl status amazon-ssm-agent
+
+            # Install Session Manager plugin for enhanced sessions
+            dnf install -y https://s3.amazonaws.com/session-manager-downloads/plugin/latest/linux_64bit/session-manager-plugin.rpm
+
+            # Create a simple log file for demonstration
+            echo "Instance started at $(date)" >> /var/log/instance-lifecycle.log
+
+            # Configure CloudWatch agent for system logs
+            cat > /opt/aws/amazon-cloudwatch-agent/etc/config.json << 'EOF'
+            {
+              "logs": {
+                "logs_collected": {
+                  "files": {
+                    "collect_list": [
+                      {
+                        "file_path": "/var/log/instance-lifecycle.log",
+                        "log_group_name": "/aws/ec2/${AWS::StackName}",
+                        "log_stream_name": "{instance_id}/lifecycle"
+                      },
+                      {
+                        "file_path": "/var/log/messages",
+                        "log_group_name": "/aws/ec2/${AWS::StackName}",
+                        "log_stream_name": "{instance_id}/messages"
+                      },
+                      {
+                        "file_path": "/var/log/user-data.log",
+                        "log_group_name": "/aws/ec2/${AWS::StackName}",
+                        "log_stream_name": "{instance_id}/user-data"
+                      }
+                    ]
+                  }
+                }
+              },
+              "metrics": {
+                "namespace": "CustomEC2Metrics",
+                "metrics_collected": {
+                  "mem": {
+                    "measurement": [
+                      {
+                        "name": "mem_used_percent",
+                        "rename": "MemoryUtilization",
+                        "unit": "Percent"
+                      }
+                    ],
+                    "metrics_collection_interval": 60
+                  },
+                  "disk": {
+                    "measurement": [
+                      {
+                        "name": "used_percent",
+                        "rename": "DiskUtilization",
+                        "unit": "Percent"
+                      }
+                    ],
+                    "metrics_collection_interval": 60,
+                    "resources": [
+                      "/"
+                    ]
+                  }
+                }
+              }
+            }
+            EOF
+
+            # Start CloudWatch agent
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+              -a fetch-config \
+              -m ec2 \
+              -s \
+              -c file:/opt/aws/amazon-cloudwatch-agent/etc/config.json
+
+            echo "User data script completed at $(date)"
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}-Instance'
+              - Key: AutoStart
+                Value: 'true'
+              - Key: AutoStop
+                Value: 'true'
+              - Key: Schedule
+                Value: 'Weekdays-9AM-7PM'
+              - Key: AccessMethod
+                Value: 'SSM-Only'
+              - Key: ManagedBy
+                Value: 'CloudFormation'
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}-Volume'
+              - Key: ManagedBy
+                Value: 'CloudFormation'
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - Key: Name
+              Value: !Sub '${AWS::StackName}-LaunchTemplate'
+
+  # EC2 Instance from Launch Template
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - SSMEndpoint
+      - SSMMessagesEndpoint
+      - EC2MessagesEndpoint
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref EC2LaunchTemplate
+        Version: !GetAtt EC2LaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref SubnetId
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Instance'
+        - Key: LaunchedFrom
+          Value: 'LaunchTemplate'
+
+  # CloudWatch Log Group for instance logs
+  InstanceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/ec2/${AWS::StackName}'
+      RetentionInDays: 7
+
+  # Dead Letter Queue for failed Lambda invocations
+  LambdaFailureDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-Lambda-DLQ'
+      MessageRetentionPeriod: 1209600  # 14 days
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Lambda-DLQ'
+
+  # IAM Role for Lambda execution
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-Lambda-Role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: EC2StartStopPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ec2:StartInstances'
+                  - 'ec2:StopInstances'
+                  - 'ec2:DescribeInstances'
+                  - 'ec2:DescribeInstanceStatus'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'sqs:SendMessage'
+                Resource: !GetAtt LambdaFailureDLQ.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Lambda-Role'
+
+  # Lambda function to start EC2 instances
+  StartEC2Lambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-StartEC2'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaFailureDLQ.Arn
+      Environment:
+        Variables:
+          INSTANCE_ID: !Ref EC2Instance
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          from datetime import datetime
+
+          ec2 = boto3.client('ec2')
+
+          def lambda_handler(event, context):
+              instance_id = os.environ['INSTANCE_ID']
+
+              try:
+                  # Check current state
+                  response = ec2.describe_instances(InstanceIds=[instance_id])
+                  instance = response['Reservations'][0]['Instances'][0]
+                  state = instance['State']['Name']
+
+                  print(f"[{datetime.utcnow().isoformat()}] Current state of {instance_id}: {state}")
+
+                  if state == 'stopped':
+                      ec2.start_instances(InstanceIds=[instance_id])
+                      print(f"[{datetime.utcnow().isoformat()}] Started instance: {instance_id}")
+
+                      # Wait for instance to be running
+                      waiter = ec2.get_waiter('instance_running')
+                      waiter.wait(InstanceIds=[instance_id])
+
+                      print(f"[{datetime.utcnow().isoformat()}] Instance {instance_id} is now running")
+
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'message': f'Successfully started instance {instance_id}',
+                              'instanceId': instance_id,
+                              'previousState': state,
+                              'currentState': 'running',
+                              'timestamp': datetime.utcnow().isoformat()
+                          })
+                      }
+                  else:
+                      print(f"[{datetime.utcnow().isoformat()}] Instance {instance_id} is already in state: {state}")
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'message': f'Instance {instance_id} is already {state}',
+                              'instanceId': instance_id,
+                              'state': state,
+                              'timestamp': datetime.utcnow().isoformat()
+                          })
+                      }
+              except Exception as e:
+                  error_msg = f"Error starting instance: {str(e)}"
+                  print(f"[{datetime.utcnow().isoformat()}] {error_msg}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': error_msg,
+                          'timestamp': datetime.utcnow().isoformat()
+                      })
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-StartEC2'
+
+  # Lambda function to stop EC2 instances
+  StopEC2Lambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-StopEC2'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaFailureDLQ.Arn
+      Environment:
+        Variables:
+          INSTANCE_ID: !Ref EC2Instance
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          from datetime import datetime
+
+          ec2 = boto3.client('ec2')
+
+          def lambda_handler(event, context):
+              instance_id = os.environ['INSTANCE_ID']
+
+              try:
+                  # Check current state
+                  response = ec2.describe_instances(InstanceIds=[instance_id])
+                  instance = response['Reservations'][0]['Instances'][0]
+                  state = instance['State']['Name']
+
+                  print(f"[{datetime.utcnow().isoformat()}] Current state of {instance_id}: {state}")
+
+                  if state == 'running':
+                      ec2.stop_instances(InstanceIds=[instance_id])
+                      print(f"[{datetime.utcnow().isoformat()}] Stopped instance: {instance_id}")
+
+                      # Wait for instance to be stopped
+                      waiter = ec2.get_waiter('instance_stopped')
+                      waiter.wait(InstanceIds=[instance_id])
+
+                      print(f"[{datetime.utcnow().isoformat()}] Instance {instance_id} is now stopped")
+
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'message': f'Successfully stopped instance {instance_id}',
+                              'instanceId': instance_id,
+                              'previousState': state,
+                              'currentState': 'stopped',
+                              'timestamp': datetime.utcnow().isoformat()
+                          })
+                      }
+                  else:
+                      print(f"[{datetime.utcnow().isoformat()}] Instance {instance_id} is already in state: {state}")
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'message': f'Instance {instance_id} is already {state}',
+                              'instanceId': instance_id,
+                              'state': state,
+                              'timestamp': datetime.utcnow().isoformat()
+                          })
+                      }
+              except Exception as e:
+                  error_msg = f"Error stopping instance: {str(e)}"
+                  print(f"[{datetime.utcnow().isoformat()}] {error_msg}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': error_msg,
+                          'timestamp': datetime.utcnow().isoformat()
+                      })
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-StopEC2'
+
+  # EventBridge Rule to start instance at 9 AM weekdays (UTC)
+  StartInstanceRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-StartInstance'
+      Description: 'Start EC2 instance at 9 AM on weekdays (UTC)'
+      ScheduleExpression: 'cron(0 9 ? * MON-FRI *)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt StartEC2Lambda.Arn
+          Id: StartEC2Target
+          RetryPolicy:
+            MaximumRetryAttempts: 2
+
+  # EventBridge Rule to stop instance at 7 PM weekdays (UTC)
+  StopInstanceRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-StopInstance'
+      Description: 'Stop EC2 instance at 7 PM on weekdays (UTC)'
+      ScheduleExpression: 'cron(0 19 ? * MON-FRI *)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt StopEC2Lambda.Arn
+          Id: StopEC2Target
+          RetryPolicy:
+            MaximumRetryAttempts: 2
+
+  # Permission for EventBridge to invoke Start Lambda
+  StartLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StartEC2Lambda
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt StartInstanceRule.Arn
+
+  # Permission for EventBridge to invoke Stop Lambda
+  StopLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StopEC2Lambda
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt StopInstanceRule.Arn
+
+  # CloudWatch Log Group for Lambda functions
+  StartLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${StartEC2Lambda}'
+      RetentionInDays: 7
+
+  StopLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${StopEC2Lambda}'
+      RetentionInDays: 7
+
+Outputs:
+  LaunchTemplateId:
+    Description: 'Launch Template ID'
+    Value: !Ref EC2LaunchTemplate
+    Export:
+      Name: !Sub '${AWS::StackName}-LaunchTemplateId'
+
+  LaunchTemplateVersion:
+    Description: 'Launch Template Latest Version'
+    Value: !GetAtt EC2LaunchTemplate.LatestVersionNumber
+    Export:
+      Name: !Sub '${AWS::StackName}-LaunchTemplateVersion'
+
+  InstanceId:
+    Description: 'EC2 Instance ID'
+    Value: !Ref EC2Instance
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceId'
+
+  InstancePrivateIP:
+    Description: 'Private IP address of the EC2 instance'
+    Value: !GetAtt EC2Instance.PrivateIp
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateIP'
+
+  SecurityGroupId:
+    Description: 'Security Group ID (No inbound rules - SSM only)'
+    Value: !Ref EC2SecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityGroupId'
+
+  StartLambdaArn:
+    Description: 'ARN of the Start Lambda function'
+    Value: !GetAtt StartEC2Lambda.Arn
+
+  StopLambdaArn:
+    Description: 'ARN of the Stop Lambda function'
+    Value: !GetAtt StopEC2Lambda.Arn
+
+  DeadLetterQueueUrl:
+    Description: 'URL of the Dead Letter Queue for failed Lambda invocations'
+    Value: !Ref LambdaFailureDLQ
+
+  DeadLetterQueueArn:
+    Description: 'ARN of the Dead Letter Queue'
+    Value: !GetAtt LambdaFailureDLQ.Arn
+
+  SSMSessionCommand:
+    Description: 'Command to connect via SSM Session Manager'
+    Value: !Sub 'aws ssm start-session --target ${EC2Instance} --region ${AWS::Region}'
+
+  SSMPortForwardCommand:
+    Description: 'Example: Port forwarding via SSM (e.g., for web server on port 80)'
+    Value: !Sub 'aws ssm start-session --target ${EC2Instance} --document-name AWS-StartPortForwardingSession --parameters "portNumber=80,localPortNumber=8080" --region ${AWS::Region}'
+
+  ScheduleInfo:
+    Description: 'Instance schedule information'
+    Value: 'Instance starts at 9 AM and stops at 7 PM (UTC) on weekdays (Mon-Fri)'
+
+  AccessMethod:
+    Description: 'Access method'
+    Value: 'SSM Session Manager only - No SSH access configured'
+
+  LogGroupName:
+    Description: 'CloudWatch Log Group for instance logs'
+    Value: !Sub '/aws/ec2/${AWS::StackName}'
+
+  StartLambdaLogGroup:
+    Description: 'CloudWatch Log Group for Start Lambda'
+    Value: !Sub '/aws/lambda/${StartEC2Lambda}'
+
+  StopLambdaLogGroup:
+    Description: 'CloudWatch Log Group for Stop Lambda'
+    Value: !Sub '/aws/lambda/${StopEC2Lambda}'
