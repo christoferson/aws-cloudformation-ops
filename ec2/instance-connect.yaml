@@ -1,0 +1,345 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'EC2 instance with SSM Session Manager and EC2 Instance Connect enabled'
+
+Parameters:
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64'
+    Description: 'Latest Amazon Linux 2023 AMI ID from SSM Parameter Store'
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+    Description: 'EC2 instance type'
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: 'VPC ID where the instance will be launched'
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: 'Subnet ID where the instance will be launched'
+
+  VolumeSize:
+    Type: Number
+    Default: 20
+    MinValue: 8
+    MaxValue: 100
+    Description: 'EBS volume size in GB'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Network Configuration'
+        Parameters:
+          - VpcId
+          - SubnetId
+      - Label:
+          default: 'Instance Configuration'
+        Parameters:
+          - InstanceType
+          - LatestAmiId
+          - VolumeSize
+
+Resources:
+  # IAM Role for EC2 Instance (SSM Session Manager)
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-EC2-Role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore'
+        - 'arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-EC2-Role'
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-EC2-Profile'
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # Security Group - Allows EC2 Instance Connect and SSM
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-SG'
+      GroupDescription: 'Security group for EC2 with SSM and Instance Connect access'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        # EC2 Instance Connect uses AWS IP ranges for SSH
+        # These IPs vary by region - this is for us-east-1
+        # For other regions, check: https://ip-ranges.amazonaws.com/ip-ranges.json
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 18.206.107.24/29
+          Description: 'EC2 Instance Connect us-east-1'
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTPS for SSM, CloudWatch, and package updates'
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTP for package updates'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-SG'
+
+  # Security Group for VPC Endpoints (if using private subnet)
+  VPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-VPCEndpoint-SG'
+      GroupDescription: 'Security group for SSM VPC endpoints'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+          Description: 'HTTPS from EC2 instances'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-VPCEndpoint-SG'
+
+  # VPC Endpoints for SSM (required for private subnets, optional for public)
+  SSMEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  SSMMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  EC2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  # EC2 Instance Connect Endpoint (new service for private subnet access)
+  EC2InstanceConnectEndpoint:
+    Type: AWS::EC2::InstanceConnectEndpoint
+    Properties:
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-EIC-Endpoint'
+
+  # Launch Template
+  EC2LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-LaunchTemplate'
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref EC2SecurityGroup
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref VolumeSize
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+              Iops: 3000
+              Throughput: 125
+        MetadataOptions:
+          HttpTokens: required  # Enforce IMDSv2
+          HttpPutResponseHopLimit: 1
+          HttpEndpoint: enabled
+          InstanceMetadataTags: enabled
+        Monitoring:
+          Enabled: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -e
+
+            # Log all output
+            exec > >(tee /var/log/user-data.log)
+            exec 2>&1
+
+            echo "Starting user data script at $(date)"
+
+            # Update system
+            dnf update -y
+
+            # Install CloudWatch agent
+            dnf install -y amazon-cloudwatch-agent
+
+            # Ensure SSM agent is running (pre-installed on AL2023)
+            systemctl enable amazon-ssm-agent
+            systemctl start amazon-ssm-agent
+            systemctl status amazon-ssm-agent
+
+            # Install EC2 Instance Connect (pre-installed on AL2023, but ensure it's configured)
+            dnf install -y ec2-instance-connect
+
+            # Ensure SSH is enabled and running
+            systemctl enable sshd
+            systemctl start sshd
+            systemctl status sshd
+
+            # Create a test user for demonstration (optional)
+            # useradd -m -s /bin/bash testuser
+            # echo "testuser ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/testuser
+
+            echo "Instance initialization completed at $(date)"
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}-Instance'
+              - Key: AccessMethod
+                Value: 'SSM-and-InstanceConnect'
+              - Key: ManagedBy
+                Value: 'CloudFormation'
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}-Volume'
+              - Key: ManagedBy
+                Value: 'CloudFormation'
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - Key: Name
+              Value: !Sub '${AWS::StackName}-LaunchTemplate'
+
+  # EC2 Instance from Launch Template
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - SSMEndpoint
+      - SSMMessagesEndpoint
+      - EC2MessagesEndpoint
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref EC2LaunchTemplate
+        Version: !GetAtt EC2LaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref SubnetId
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Instance'
+
+  # CloudWatch Log Group for instance logs
+  InstanceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/ec2/${AWS::StackName}'
+      RetentionInDays: 7
+
+Outputs:
+  LaunchTemplateId:
+    Description: 'Launch Template ID'
+    Value: !Ref EC2LaunchTemplate
+    Export:
+      Name: !Sub '${AWS::StackName}-LaunchTemplateId'
+
+  InstanceId:
+    Description: 'EC2 Instance ID'
+    Value: !Ref EC2Instance
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceId'
+
+  InstancePrivateIP:
+    Description: 'Private IP address of the EC2 instance'
+    Value: !GetAtt EC2Instance.PrivateIp
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateIP'
+
+  SecurityGroupId:
+    Description: 'Security Group ID'
+    Value: !Ref EC2SecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityGroupId'
+
+  InstanceConnectEndpointId:
+    Description: 'EC2 Instance Connect Endpoint ID'
+    Value: !Ref EC2InstanceConnectEndpoint
+
+  SSMSessionCommand:
+    Description: 'Command to connect via SSM Session Manager'
+    Value: !Sub 'aws ssm start-session --target ${EC2Instance} --region ${AWS::Region}'
+
+  EC2InstanceConnectCommand:
+    Description: 'Command to connect via EC2 Instance Connect'
+    Value: !Sub 'aws ec2-instance-connect ssh --instance-id ${EC2Instance} --region ${AWS::Region}'
+
+  EC2InstanceConnectSSHCommand:
+    Description: 'Alternative SSH command using Instance Connect (requires AWS CLI v2)'
+    Value: !Sub |
+      aws ec2-instance-connect send-ssh-public-key \
+        --instance-id ${EC2Instance} \
+        --instance-os-user ec2-user \
+        --ssh-public-key file://~/.ssh/id_rsa.pub \
+        --region ${AWS::Region}
+
+  SSMPortForwardCommand:
+    Description: 'Example: Port forwarding via SSM (e.g., for web server on port 80)'
+    Value: !Sub 'aws ssm start-session --target ${EC2Instance} --document-name AWS-StartPortForwardingSession --parameters "portNumber=80,localPortNumber=8080" --region ${AWS::Region}'
+
+  AccessMethods:
+    Description: 'Available access methods'
+    Value: 'SSM Session Manager and EC2 Instance Connect'
+
+  LogGroupName:
+    Description: 'CloudWatch Log Group for instance logs'
+    Value: !Sub '/aws/ec2/${AWS::StackName}'
+
+  ImportantNotes:
+    Description: 'Important configuration notes'
+    Value: |
+      1. SSM Session Manager: Use AWS CLI or Console to connect
+      2. EC2 Instance Connect: Use AWS CLI v2 for SSH access
+      3. Security Group allows SSH (port 22) from EC2 Instance Connect service IPs
+      4. Update EC2 Instance Connect IP ranges based on your region
+      5. For private subnets, VPC endpoints are created automatically
