@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'Security Groups for VPC - Endpoints, EC2 Instances, Load Balancer, Database, Cache, EFS, and Lambda'
+Description: 'Security Groups for VPC - Endpoints, EC2 Instance Connect, EC2 Instances, Load Balancer, Database, Cache, EFS, and Lambda'
 
 Parameters:
   VpcId:
@@ -23,7 +23,7 @@ Metadata:
 
 Resources:
   # ============================================================================
-  # VPC Endpoints Security Group
+  # VPC Endpoints Security Group (SSM, EC2 Messages, etc.)
   # ============================================================================
   VPCEndpointSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -46,6 +46,29 @@ Resources:
           Value: !Sub '${AWS::StackName}-VPCEndpoint-SG'
         - Key: Purpose
           Value: 'VPC Endpoints'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # ============================================================================
+  # EC2 Instance Connect Endpoint Security Group
+  # ============================================================================
+  EICEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-EIC-Endpoint-SG'
+      GroupDescription: 'Security group for EC2 Instance Connect Endpoint'
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref VpcCidr
+          Description: 'SSH to instances in VPC'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-EIC-Endpoint-SG'
+        - Key: Purpose
+          Value: 'EC2 Instance Connect Endpoint'
         - Key: ManagedBy
           Value: 'CloudFormation'
 
@@ -106,6 +129,11 @@ Resources:
           ToPort: 8080
           SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
           Description: 'Application port from Load Balancer'
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref EICEndpointSecurityGroup
+          Description: 'SSH from EC2 Instance Connect Endpoint'
       SecurityGroupEgress:
         - IpProtocol: tcp
           FromPort: 443
@@ -198,6 +226,11 @@ Resources:
         - IpProtocol: -1
           SourceSecurityGroupId: !Ref WebInstanceSecurityGroup
           Description: 'All traffic from web instances'
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref EICEndpointSecurityGroup
+          Description: 'SSH from EC2 Instance Connect Endpoint'
       SecurityGroupEgress:
         - IpProtocol: tcp
           FromPort: 443
@@ -467,6 +500,12 @@ Outputs:
     Value: !Ref VPCEndpointSecurityGroup
     Export:
       Name: !Sub '${AWS::StackName}-VPCEndpoint-SG'
+
+  EICEndpointSecurityGroupId:
+    Description: 'Security Group ID for EC2 Instance Connect Endpoint'
+    Value: !Ref EICEndpointSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-EIC-Endpoint-SG'
 
   LoadBalancerSecurityGroupId:
     Description: 'Security Group ID for Load Balancer'
