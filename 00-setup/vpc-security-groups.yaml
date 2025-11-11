@@ -1,0 +1,511 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Security Groups for VPC - Endpoints, EC2 Instances, Load Balancer, Database, Cache, EFS, and Lambda'
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: 'VPC ID where security groups will be created'
+
+  VpcCidr:
+    Type: String
+    Description: 'VPC CIDR block'
+    Default: '10.0.0.0/16'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Network Configuration'
+        Parameters:
+          - VpcId
+          - VpcCidr
+
+Resources:
+  # ============================================================================
+  # VPC Endpoints Security Group
+  # ============================================================================
+  VPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-VPCEndpoint-SG'
+      GroupDescription: 'Security group for VPC endpoints (SSM, EC2 Messages, etc.)'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+          Description: 'HTTPS from VPC for VPC endpoint access'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'Allow all outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-VPCEndpoint-SG'
+        - Key: Purpose
+          Value: 'VPC Endpoints'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # ============================================================================
+  # Load Balancer Security Group
+  # ============================================================================
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-LoadBalancer-SG'
+      GroupDescription: 'Security group for Application Load Balancer'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '0.0.0.0/0'
+          Description: 'HTTPS from internet'
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: '0.0.0.0/0'
+          Description: 'HTTP from internet'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'Allow all outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-LoadBalancer-SG'
+        - Key: Purpose
+          Value: 'Application Load Balancer'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # ============================================================================
+  # Web/Application Instances Security Group
+  # ============================================================================
+  WebInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-WebInstance-SG'
+      GroupDescription: 'Security group for web/application EC2 instances'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+          Description: 'HTTP from Load Balancer'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+          Description: 'HTTPS from Load Balancer'
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+          Description: 'Application port from Load Balancer'
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTPS for package updates and AWS API calls'
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTP for package updates'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-WebInstance-SG'
+        - Key: Purpose
+          Value: 'Web/Application Instances'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  WebInstanceToVPCEndpointEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref WebInstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      DestinationSecurityGroupId: !Ref VPCEndpointSecurityGroup
+      Description: 'HTTPS to VPC endpoints for SSM'
+
+  WebInstanceToDatabaseEgressMySQL:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref WebInstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      DestinationSecurityGroupId: !Ref DatabaseSecurityGroup
+      Description: 'MySQL/Aurora to database'
+
+  WebInstanceToDatabaseEgressPostgres:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref WebInstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      DestinationSecurityGroupId: !Ref DatabaseSecurityGroup
+      Description: 'PostgreSQL to database'
+
+  WebInstanceToCacheEgressRedis:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref WebInstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      DestinationSecurityGroupId: !Ref CacheSecurityGroup
+      Description: 'Redis to cache'
+
+  WebInstanceToCacheEgressMemcached:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref WebInstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 11211
+      ToPort: 11211
+      DestinationSecurityGroupId: !Ref CacheSecurityGroup
+      Description: 'Memcached to cache'
+
+  WebInstanceToEFSEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref WebInstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      DestinationSecurityGroupId: !Ref EFSSecurityGroup
+      Description: 'NFS to EFS'
+
+  # ============================================================================
+  # Private/Backend Instances Security Group
+  # ============================================================================
+  PrivateInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-PrivateInstance-SG'
+      GroupDescription: 'Security group for private EC2 instances (no direct internet access)'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: -1
+          SourceSecurityGroupId: !Ref WebInstanceSecurityGroup
+          Description: 'All traffic from web instances'
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTPS for package updates and AWS API calls'
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTP for package updates'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-PrivateInstance-SG'
+        - Key: Purpose
+          Value: 'Private Backend Instances'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  PrivateInstanceToVPCEndpointEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref PrivateInstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      DestinationSecurityGroupId: !Ref VPCEndpointSecurityGroup
+      Description: 'HTTPS to VPC endpoints for SSM'
+
+  PrivateInstanceToDatabaseEgressMySQL:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref PrivateInstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      DestinationSecurityGroupId: !Ref DatabaseSecurityGroup
+      Description: 'MySQL/Aurora to database'
+
+  PrivateInstanceToDatabaseEgressPostgres:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref PrivateInstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      DestinationSecurityGroupId: !Ref DatabaseSecurityGroup
+      Description: 'PostgreSQL to database'
+
+  PrivateInstanceToCacheEgressRedis:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref PrivateInstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      DestinationSecurityGroupId: !Ref CacheSecurityGroup
+      Description: 'Redis to cache'
+
+  PrivateInstanceToEFSEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref PrivateInstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      DestinationSecurityGroupId: !Ref EFSSecurityGroup
+      Description: 'NFS to EFS'
+
+  # ============================================================================
+  # Database Security Group (RDS/Aurora)
+  # ============================================================================
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-Database-SG'
+      GroupDescription: 'Security group for RDS/Aurora databases'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref WebInstanceSecurityGroup
+          Description: 'MySQL/Aurora from web instances'
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref PrivateInstanceSecurityGroup
+          Description: 'MySQL/Aurora from private instances'
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref WebInstanceSecurityGroup
+          Description: 'PostgreSQL from web instances'
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref PrivateInstanceSecurityGroup
+          Description: 'PostgreSQL from private instances'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 127.0.0.1/32
+          Description: 'No outbound access required'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Database-SG'
+        - Key: Purpose
+          Value: 'RDS/Aurora Database'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # ============================================================================
+  # ElastiCache Security Group (Redis/Memcached)
+  # ============================================================================
+  CacheSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-Cache-SG'
+      GroupDescription: 'Security group for ElastiCache (Redis/Memcached)'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref WebInstanceSecurityGroup
+          Description: 'Redis from web instances'
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref PrivateInstanceSecurityGroup
+          Description: 'Redis from private instances'
+        - IpProtocol: tcp
+          FromPort: 11211
+          ToPort: 11211
+          SourceSecurityGroupId: !Ref WebInstanceSecurityGroup
+          Description: 'Memcached from web instances'
+        - IpProtocol: tcp
+          FromPort: 11211
+          ToPort: 11211
+          SourceSecurityGroupId: !Ref PrivateInstanceSecurityGroup
+          Description: 'Memcached from private instances'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 127.0.0.1/32
+          Description: 'No outbound access required'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Cache-SG'
+        - Key: Purpose
+          Value: 'ElastiCache'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # ============================================================================
+  # EFS Security Group
+  # ============================================================================
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-EFS-SG'
+      GroupDescription: 'Security group for EFS mount targets'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref WebInstanceSecurityGroup
+          Description: 'NFS from web instances'
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref PrivateInstanceSecurityGroup
+          Description: 'NFS from private instances'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 127.0.0.1/32
+          Description: 'No outbound access required'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-EFS-SG'
+        - Key: Purpose
+          Value: 'EFS Mount Targets'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # ============================================================================
+  # Lambda Security Group (for VPC-enabled Lambda functions)
+  # ============================================================================
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-Lambda-SG'
+      GroupDescription: 'Security group for VPC-enabled Lambda functions'
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTPS for AWS API calls'
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          DestinationSecurityGroupId: !Ref DatabaseSecurityGroup
+          Description: 'MySQL/Aurora to database'
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          DestinationSecurityGroupId: !Ref DatabaseSecurityGroup
+          Description: 'PostgreSQL to database'
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          DestinationSecurityGroupId: !Ref CacheSecurityGroup
+          Description: 'Redis to cache'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Lambda-SG'
+        - Key: Purpose
+          Value: 'Lambda Functions'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  LambdaToVPCEndpointEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      DestinationSecurityGroupId: !Ref VPCEndpointSecurityGroup
+      Description: 'HTTPS to VPC endpoints'
+
+  DatabaseFromLambdaIngressMySQL:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DatabaseSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: 'MySQL/Aurora from Lambda'
+
+  DatabaseFromLambdaIngressPostgres:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DatabaseSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: 'PostgreSQL from Lambda'
+
+  CacheFromLambdaIngressRedis:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref CacheSecurityGroup
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: 'Redis from Lambda'
+
+Outputs:
+  VPCEndpointSecurityGroupId:
+    Description: 'Security Group ID for VPC Endpoints'
+    Value: !Ref VPCEndpointSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCEndpoint-SG'
+
+  LoadBalancerSecurityGroupId:
+    Description: 'Security Group ID for Load Balancer'
+    Value: !Ref LoadBalancerSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LoadBalancer-SG'
+
+  WebInstanceSecurityGroupId:
+    Description: 'Security Group ID for Web/Application Instances'
+    Value: !Ref WebInstanceSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-WebInstance-SG'
+
+  PrivateInstanceSecurityGroupId:
+    Description: 'Security Group ID for Private Instances'
+    Value: !Ref PrivateInstanceSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateInstance-SG'
+
+  DatabaseSecurityGroupId:
+    Description: 'Security Group ID for Database'
+    Value: !Ref DatabaseSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-Database-SG'
+
+  CacheSecurityGroupId:
+    Description: 'Security Group ID for ElastiCache'
+    Value: !Ref CacheSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-Cache-SG'
+
+  EFSSecurityGroupId:
+    Description: 'Security Group ID for EFS'
+    Value: !Ref EFSSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-EFS-SG'
+
+  LambdaSecurityGroupId:
+    Description: 'Security Group ID for Lambda Functions'
+    Value: !Ref LambdaSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-Lambda-SG'
