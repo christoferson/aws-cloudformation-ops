@@ -1,0 +1,165 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'VPC Endpoints for AWS Systems Manager Session Manager'
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: 'VPC ID where the endpoints will be created'
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: 'Subnet IDs for the VPC endpoints (select at least one, preferably one per AZ)'
+
+  VpcCidr:
+    Type: String
+    Description: 'VPC CIDR block for security group ingress rule'
+    Default: '10.0.0.0/16'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Network Configuration'
+        Parameters:
+          - VpcId
+          - VpcCidr
+          - SubnetIds
+    ParameterLabels:
+      VpcId:
+        default: 'VPC ID'
+      VpcCidr:
+        default: 'VPC CIDR Block'
+      SubnetIds:
+        default: 'Subnet IDs for Endpoints'
+
+Resources:
+  # Security Group for VPC Endpoints
+  VPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-VPCEndpoint-SG'
+      GroupDescription: 'Security group for SSM VPC endpoints - allows access from VPC'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+          Description: 'HTTPS from VPC'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'Allow all outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-VPCEndpoint-SG'
+        - Key: Purpose
+          Value: 'SSM VPC Endpoints'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # SSM VPC Endpoint
+  SSMEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-SSM-Endpoint'
+        - Key: Service
+          Value: 'SSM'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # SSM Messages VPC Endpoint
+  SSMMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-SSMMessages-Endpoint'
+        - Key: Service
+          Value: 'SSM Messages'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # EC2 Messages VPC Endpoint
+  EC2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-EC2Messages-Endpoint'
+        - Key: Service
+          Value: 'EC2 Messages'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+Outputs:
+  VPCEndpointSecurityGroupId:
+    Description: 'Security Group ID for VPC Endpoints'
+    Value: !Ref VPCEndpointSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityGroupId'
+
+  SSMEndpointId:
+    Description: 'SSM VPC Endpoint ID'
+    Value: !Ref SSMEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-SSMEndpointId'
+
+  SSMMessagesEndpointId:
+    Description: 'SSM Messages VPC Endpoint ID'
+    Value: !Ref SSMMessagesEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-SSMMessagesEndpointId'
+
+  EC2MessagesEndpointId:
+    Description: 'EC2 Messages VPC Endpoint ID'
+    Value: !Ref EC2MessagesEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-EC2MessagesEndpointId'
+
+  SSMEndpointDNS:
+    Description: 'SSM Endpoint DNS names'
+    Value: !Join [', ', !GetAtt SSMEndpoint.DnsEntries]
+
+  SSMMessagesEndpointDNS:
+    Description: 'SSM Messages Endpoint DNS names'
+    Value: !Join [', ', !GetAtt SSMMessagesEndpoint.DnsEntries]
+
+  EC2MessagesEndpointDNS:
+    Description: 'EC2 Messages Endpoint DNS names'
+    Value: !Join [', ', !GetAtt EC2MessagesEndpoint.DnsEntries]
+
+  VpcCidrConfigured:
+    Description: 'VPC CIDR configured for VPC endpoint access'
+    Value: !Ref VpcCidr
+
+  StackInfo:
+    Description: 'Stack information'
+    Value: !Sub |
+      VPC Endpoints created successfully in VPC ${VpcId}
+      Private DNS is enabled for all endpoints
+      Any instance in the VPC (${VpcCidr}) can access these endpoints
