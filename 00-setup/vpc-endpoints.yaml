@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'VPC Endpoints for AWS Systems Manager Session Manager'
+Description: 'VPC Endpoints for AWS Systems Manager Session Manager and EC2 Instance Connect'
 
 Parameters:
   VpcId:
@@ -8,13 +8,15 @@ Parameters:
 
   SubnetIds:
     Type: List<AWS::EC2::Subnet::Id>
-    Description: 'Subnet IDs for the VPC endpoints (select at least one, preferably one per AZ)'
+    Description: 'Subnet IDs for the VPC endpoints (select at least one, preferably one per AZ). First subnet will be used for EIC endpoint.'
 
-  VpcCidr:
-    Type: String
-    Description: 'VPC CIDR block for security group ingress rule'
-    Default: '10.0.0.0/16'
-    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+  VPCEndpointSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: 'Security Group ID for SSM VPC Endpoints'
+
+  EICEndpointSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: 'Security Group ID for EC2 Instance Connect Endpoint'
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -23,42 +25,23 @@ Metadata:
           default: 'Network Configuration'
         Parameters:
           - VpcId
-          - VpcCidr
           - SubnetIds
+      - Label:
+          default: 'Security Groups'
+        Parameters:
+          - VPCEndpointSecurityGroupId
+          - EICEndpointSecurityGroupId
     ParameterLabels:
       VpcId:
         default: 'VPC ID'
-      VpcCidr:
-        default: 'VPC CIDR Block'
       SubnetIds:
         default: 'Subnet IDs for Endpoints'
+      VPCEndpointSecurityGroupId:
+        default: 'VPC Endpoint Security Group ID'
+      EICEndpointSecurityGroupId:
+        default: 'EIC Endpoint Security Group ID'
 
 Resources:
-  # Security Group for VPC Endpoints
-  VPCEndpointSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupName: !Sub '${AWS::StackName}-VPCEndpoint-SG'
-      GroupDescription: 'Security group for SSM VPC endpoints - allows access from VPC'
-      VpcId: !Ref VpcId
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          CidrIp: !Ref VpcCidr
-          Description: 'HTTPS from VPC'
-      SecurityGroupEgress:
-        - IpProtocol: -1
-          CidrIp: 0.0.0.0/0
-          Description: 'Allow all outbound traffic'
-      Tags:
-        - Key: Name
-          Value: !Sub '${AWS::StackName}-VPCEndpoint-SG'
-        - Key: Purpose
-          Value: 'SSM VPC Endpoints'
-        - Key: ManagedBy
-          Value: 'CloudFormation'
-
   # SSM VPC Endpoint
   SSMEndpoint:
     Type: AWS::EC2::VPCEndpoint
@@ -69,7 +52,7 @@ Resources:
       PrivateDnsEnabled: true
       SubnetIds: !Ref SubnetIds
       SecurityGroupIds:
-        - !Ref VPCEndpointSecurityGroup
+        - !Ref VPCEndpointSecurityGroupId
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-SSM-Endpoint'
@@ -88,7 +71,7 @@ Resources:
       PrivateDnsEnabled: true
       SubnetIds: !Ref SubnetIds
       SecurityGroupIds:
-        - !Ref VPCEndpointSecurityGroup
+        - !Ref VPCEndpointSecurityGroupId
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-SSMMessages-Endpoint'
@@ -107,7 +90,7 @@ Resources:
       PrivateDnsEnabled: true
       SubnetIds: !Ref SubnetIds
       SecurityGroupIds:
-        - !Ref VPCEndpointSecurityGroup
+        - !Ref VPCEndpointSecurityGroupId
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-EC2Messages-Endpoint'
@@ -116,13 +99,23 @@ Resources:
         - Key: ManagedBy
           Value: 'CloudFormation'
 
-Outputs:
-  VPCEndpointSecurityGroupId:
-    Description: 'Security Group ID for VPC Endpoints'
-    Value: !Ref VPCEndpointSecurityGroup
-    Export:
-      Name: !Sub '${AWS::StackName}-SecurityGroupId'
+  # EC2 Instance Connect Endpoint (uses first subnet from SubnetIds)
+  EC2InstanceConnectEndpoint:
+    Type: AWS::EC2::InstanceConnectEndpoint
+    Properties:
+      SubnetId: !Select [0, !Ref SubnetIds]
+      SecurityGroupIds:
+        - !Ref EICEndpointSecurityGroupId
+      PreserveClientIp: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-EIC-Endpoint'
+        - Key: Service
+          Value: 'EC2 Instance Connect'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
 
+Outputs:
   SSMEndpointId:
     Description: 'SSM VPC Endpoint ID'
     Value: !Ref SSMEndpoint
@@ -141,6 +134,18 @@ Outputs:
     Export:
       Name: !Sub '${AWS::StackName}-EC2MessagesEndpointId'
 
+  EC2InstanceConnectEndpointId:
+    Description: 'EC2 Instance Connect Endpoint ID'
+    Value: !Ref EC2InstanceConnectEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-EICEndpointId'
+
+  EC2InstanceConnectEndpointSubnet:
+    Description: 'Subnet where EIC Endpoint was created'
+    Value: !Select [0, !Ref SubnetIds]
+    Export:
+      Name: !Sub '${AWS::StackName}-EICEndpointSubnet'
+
   SSMEndpointDNS:
     Description: 'SSM Endpoint DNS names'
     Value: !Join [', ', !GetAtt SSMEndpoint.DnsEntries]
@@ -153,13 +158,24 @@ Outputs:
     Description: 'EC2 Messages Endpoint DNS names'
     Value: !Join [', ', !GetAtt EC2MessagesEndpoint.DnsEntries]
 
-  VpcCidrConfigured:
-    Description: 'VPC CIDR configured for VPC endpoint access'
-    Value: !Ref VpcCidr
+  VPCEndpointSecurityGroupUsed:
+    Description: 'Security Group ID used for VPC Endpoints'
+    Value: !Ref VPCEndpointSecurityGroupId
+
+  EICEndpointSecurityGroupUsed:
+    Description: 'Security Group ID used for EIC Endpoint'
+    Value: !Ref EICEndpointSecurityGroupId
 
   StackInfo:
     Description: 'Stack information'
     Value: !Sub |
       VPC Endpoints created successfully in VPC ${VpcId}
-      Private DNS is enabled for all endpoints
-      Any instance in the VPC (${VpcCidr}) can access these endpoints
+
+      SSM Endpoints:
+      - Private DNS is enabled for all SSM endpoints
+      - Using security group: ${VPCEndpointSecurityGroupId}
+
+      EC2 Instance Connect Endpoint:
+      - Created in first subnet from SubnetIds list
+      - Using security group: ${EICEndpointSecurityGroupId}
+      - Note: Only one EIC endpoint allowed per subnet
