@@ -184,6 +184,16 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRoleForLambda
+      Policies:
+        - PolicyName: CodeDeployS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub '${PipelineArtifactBucket.Arn}/*'
 
   EventBridgeRole:
     Type: AWS::IAM::Role
@@ -387,19 +397,10 @@ Resources:
                 - echo "Getting current version..."
                 - CURRENT_VERSION=$(aws lambda get-alias --function-name $FUNCTION_NAME --name live --query 'FunctionVersion' --output text)
                 - echo "Current version is $CURRENT_VERSION"
-                - echo "Creating AppSpec file..."
-                - echo "version 0.0" > appspec.yaml
-                - echo "Resources:" >> appspec.yaml
-                - echo "  - ${FUNCTION_NAME}:" >> appspec.yaml
-                - echo "      Type AWS::Lambda::Function" >> appspec.yaml
-                - echo "      Properties:" >> appspec.yaml
-                - echo "        Name \"${FUNCTION_NAME}\"" >> appspec.yaml
-                - echo "        Alias \"live\"" >> appspec.yaml
-                - echo "        CurrentVersion \"${CURRENT_VERSION}\"" >> appspec.yaml
-                - echo "        TargetVersion \"${NEW_VERSION}\"" >> appspec.yaml
-                - echo "Hooks:" >> appspec.yaml
-                - echo "  - BeforeAllowTraffic \"binary-calc-validation\"" >> appspec.yaml
-                - echo "AppSpec contents:"
+                - echo "Updating appspec.yaml with versions..."
+                - sed -i "s/CurrentVersion:.*/CurrentVersion: \"$CURRENT_VERSION\"/" appspec.yaml
+                - sed -i "s/TargetVersion:.*/TargetVersion: \"$NEW_VERSION\"/" appspec.yaml
+                - echo "Final AppSpec contents:"
                 - cat appspec.yaml
           artifacts:
             files:
