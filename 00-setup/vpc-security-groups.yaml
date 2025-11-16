@@ -1,5 +1,127 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'Security Groups for VPC - Endpoints, EC2 Instance Connect, EC2 Instances, Load Balancer, Database, Cache, EFS, and Lambda'
+Description: |
+  Security Groups for Multi-Tier Application Architecture
+
+  Purpose:
+    Creates a comprehensive set of security groups following the principle of least privilege
+    for a typical AWS multi-tier application with web servers, application servers, databases,
+    caching layer, file storage, and serverless functions.
+
+  Security Groups Created:
+
+    1. VPCEndpointSecurityGroup
+       Purpose: For AWS PrivateLink VPC Endpoints (SSM, EC2Messages, SSMMessages, CloudWatch Logs)
+       Ingress: TCP 443 from VPC CIDR
+       Egress: All traffic (default)
+       Used by: Interface VPC Endpoints
+
+    2. EICEndpointSecurityGroup
+       Purpose: For EC2 Instance Connect Endpoint
+       Ingress: None (AWS managed service initiates connections)
+       Egress: TCP 22 to VPC CIDR (SSH to instances)
+       Used by: EC2 Instance Connect Endpoint
+
+    3. LoadBalancerSecurityGroup
+       Purpose: For Application Load Balancer (internet-facing)
+       Ingress: TCP 80 (HTTP) and TCP 443 (HTTPS) from 0.0.0.0/0
+       Egress: TCP 80, 443, 8080 to WebInstanceSecurityGroup
+       Used by: Application Load Balancer, Network Load Balancer
+
+    4. WebInstanceSecurityGroup
+       Purpose: For web/application tier EC2 instances (receives traffic from ALB)
+       Ingress: 
+         - TCP 80, 443, 8080 from LoadBalancerSecurityGroup
+         - TCP 22 from EICEndpointSecurityGroup
+       Egress:
+         - TCP 443 to VPCEndpointSecurityGroup (SSM, CloudWatch)
+         - TCP 443, 80 to 0.0.0.0/0 (AWS APIs, package updates)
+         - TCP 3306 (MySQL) to DatabaseSecurityGroup
+         - TCP 5432 (PostgreSQL) to DatabaseSecurityGroup
+         - TCP 6379 (Redis) to CacheSecurityGroup
+         - TCP 11211 (Memcached) to CacheSecurityGroup
+         - TCP 2049 (NFS) to EFSSecurityGroup
+       Used by: EC2 instances in public/private subnets serving web traffic
+
+    5. PrivateInstanceSecurityGroup
+       Purpose: For backend/worker EC2 instances (no direct ALB access)
+       Ingress:
+         - All traffic from WebInstanceSecurityGroup
+         - TCP 22 from EICEndpointSecurityGroup
+       Egress:
+         - TCP 443 to VPCEndpointSecurityGroup (SSM, CloudWatch)
+         - TCP 443, 80 to 0.0.0.0/0 (AWS APIs, package updates)
+         - TCP 3306 (MySQL) to DatabaseSecurityGroup
+         - TCP 5432 (PostgreSQL) to DatabaseSecurityGroup
+         - TCP 6379 (Redis) to CacheSecurityGroup
+         - TCP 2049 (NFS) to EFSSecurityGroup
+       Used by: Background workers, batch processors, internal services
+
+    6. DatabaseSecurityGroup
+       Purpose: For RDS/Aurora database instances
+       Ingress:
+         - TCP 3306 (MySQL/Aurora MySQL) from WebInstanceSecurityGroup
+         - TCP 3306 from PrivateInstanceSecurityGroup
+         - TCP 3306 from LambdaSecurityGroup
+         - TCP 5432 (PostgreSQL/Aurora PostgreSQL) from WebInstanceSecurityGroup
+         - TCP 5432 from PrivateInstanceSecurityGroup
+         - TCP 5432 from LambdaSecurityGroup
+       Egress: None (databases don't initiate outbound connections)
+       Used by: RDS MySQL, RDS PostgreSQL, Aurora MySQL, Aurora PostgreSQL
+
+    7. CacheSecurityGroup
+       Purpose: For ElastiCache clusters (Redis/Memcached)
+       Ingress:
+         - TCP 6379 (Redis) from WebInstanceSecurityGroup
+         - TCP 6379 from PrivateInstanceSecurityGroup
+         - TCP 6379 from LambdaSecurityGroup
+         - TCP 11211 (Memcached) from WebInstanceSecurityGroup
+         - TCP 11211 from PrivateInstanceSecurityGroup
+       Egress: None (cache doesn't initiate outbound connections)
+       Used by: ElastiCache Redis, ElastiCache Memcached
+
+    8. EFSSecurityGroup
+       Purpose: For EFS mount targets
+       Ingress:
+         - TCP 2049 (NFS) from WebInstanceSecurityGroup
+         - TCP 2049 from PrivateInstanceSecurityGroup
+       Egress: None (EFS doesn't initiate outbound connections)
+       Used by: EFS mount targets in each availability zone
+
+    9. LambdaSecurityGroup
+       Purpose: For VPC-enabled Lambda functions
+       Ingress: None (Lambda doesn't receive inbound connections)
+       Egress:
+         - TCP 443 to VPCEndpointSecurityGroup (AWS APIs)
+         - TCP 443 to 0.0.0.0/0 (external APIs)
+         - TCP 3306 (MySQL) to DatabaseSecurityGroup
+         - TCP 5432 (PostgreSQL) to DatabaseSecurityGroup
+         - TCP 6379 (Redis) to CacheSecurityGroup
+       Used by: Lambda functions attached to VPC subnets
+
+  Traffic Flow:
+    Internet → LoadBalancer → WebInstances → Database/Cache/EFS
+                                          ↘ PrivateInstances → Database/Cache/EFS
+    Lambda → Database/Cache/VPC Endpoints
+    EIC Endpoint → Web/Private Instances (SSH)
+    All Instances → VPC Endpoints (SSM, CloudWatch Logs)
+
+  Network Architecture:
+    - No instances have public IPs
+    - All AWS service access via VPC Endpoints (PrivateLink)
+    - Package updates via S3 Gateway Endpoint
+    - SSH access via EC2 Instance Connect Endpoint (no bastion host)
+    - Session Manager access via SSM VPC Endpoints
+
+  Port Reference:
+    22    - SSH
+    80    - HTTP
+    443   - HTTPS
+    2049  - NFS (EFS)
+    3306  - MySQL/Aurora MySQL
+    5432  - PostgreSQL/Aurora PostgreSQL
+    6379  - Redis
+    8080  - Application (custom)
+    11211 - Memcached
 
 Parameters:
   VpcId:
@@ -8,7 +130,7 @@ Parameters:
 
   VpcCidr:
     Type: String
-    Description: 'VPC CIDR block'
+    Description: 'VPC CIDR block for VPC endpoint access'
     Default: '10.0.0.0/16'
     AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
 
@@ -23,13 +145,15 @@ Metadata:
 
 Resources:
   # ============================================================================
-  # VPC Endpoints Security Group (SSM, EC2 Messages, etc.)
+  # VPC Endpoints Security Group
+  # Purpose: Allow HTTPS access to VPC endpoints from within VPC
+  # Used by: SSM, SSMMessages, EC2Messages, CloudWatch Logs endpoints
   # ============================================================================
   VPCEndpointSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupName: !Sub '${AWS::StackName}-VPCEndpoint-SG'
-      GroupDescription: 'Security group for VPC endpoints (SSM, EC2 Messages, etc.)'
+      GroupDescription: 'Security group for VPC endpoints (SSM, EC2 Messages, CloudWatch Logs)'
       VpcId: !Ref VpcId
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -51,6 +175,8 @@ Resources:
 
   # ============================================================================
   # EC2 Instance Connect Endpoint Security Group
+  # Purpose: Allow SSH from EIC Endpoint to instances
+  # Used by: EC2 Instance Connect Endpoint
   # ============================================================================
   EICEndpointSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -74,6 +200,8 @@ Resources:
 
   # ============================================================================
   # Load Balancer Security Group
+  # Purpose: Accept HTTP/HTTPS from internet, forward to web instances
+  # Used by: Application Load Balancer
   # ============================================================================
   LoadBalancerSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -106,6 +234,8 @@ Resources:
 
   # ============================================================================
   # Web/Application Instances Security Group
+  # Purpose: Accept traffic from ALB, access databases/cache/EFS
+  # Used by: EC2 instances serving web traffic
   # ============================================================================
   WebInstanceSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -153,6 +283,7 @@ Resources:
         - Key: ManagedBy
           Value: 'CloudFormation'
 
+  # Egress: Web Instance → VPC Endpoints (SSM, CloudWatch)
   WebInstanceToVPCEndpointEgress:
     Type: AWS::EC2::SecurityGroupEgress
     Properties:
@@ -161,8 +292,9 @@ Resources:
       FromPort: 443
       ToPort: 443
       DestinationSecurityGroupId: !Ref VPCEndpointSecurityGroup
-      Description: 'HTTPS to VPC endpoints for SSM'
+      Description: 'HTTPS to VPC endpoints for SSM and CloudWatch'
 
+  # Egress: Web Instance → Database (MySQL)
   WebInstanceToDatabaseEgressMySQL:
     Type: AWS::EC2::SecurityGroupEgress
     Properties:
@@ -173,6 +305,7 @@ Resources:
       DestinationSecurityGroupId: !Ref DatabaseSecurityGroup
       Description: 'MySQL/Aurora to database'
 
+  # Egress: Web Instance → Database (PostgreSQL)
   WebInstanceToDatabaseEgressPostgres:
     Type: AWS::EC2::SecurityGroupEgress
     Properties:
@@ -183,6 +316,7 @@ Resources:
       DestinationSecurityGroupId: !Ref DatabaseSecurityGroup
       Description: 'PostgreSQL to database'
 
+  # Egress: Web Instance → Cache (Redis)
   WebInstanceToCacheEgressRedis:
     Type: AWS::EC2::SecurityGroupEgress
     Properties:
@@ -193,6 +327,7 @@ Resources:
       DestinationSecurityGroupId: !Ref CacheSecurityGroup
       Description: 'Redis to cache'
 
+  # Egress: Web Instance → Cache (Memcached)
   WebInstanceToCacheEgressMemcached:
     Type: AWS::EC2::SecurityGroupEgress
     Properties:
@@ -203,6 +338,7 @@ Resources:
       DestinationSecurityGroupId: !Ref CacheSecurityGroup
       Description: 'Memcached to cache'
 
+  # Egress: Web Instance → EFS
   WebInstanceToEFSEgress:
     Type: AWS::EC2::SecurityGroupEgress
     Properties:
@@ -215,6 +351,8 @@ Resources:
 
   # ============================================================================
   # Private/Backend Instances Security Group
+  # Purpose: Backend processing, accepts traffic from web tier
+  # Used by: Worker instances, batch processors
   # ============================================================================
   PrivateInstanceSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -250,6 +388,7 @@ Resources:
         - Key: ManagedBy
           Value: 'CloudFormation'
 
+  # Egress: Private Instance → VPC Endpoints
   PrivateInstanceToVPCEndpointEgress:
     Type: AWS::EC2::SecurityGroupEgress
     Properties:
@@ -258,8 +397,9 @@ Resources:
       FromPort: 443
       ToPort: 443
       DestinationSecurityGroupId: !Ref VPCEndpointSecurityGroup
-      Description: 'HTTPS to VPC endpoints for SSM'
+      Description: 'HTTPS to VPC endpoints for SSM and CloudWatch'
 
+  # Egress: Private Instance → Database (MySQL)
   PrivateInstanceToDatabaseEgressMySQL:
     Type: AWS::EC2::SecurityGroupEgress
     Properties:
@@ -270,6 +410,7 @@ Resources:
       DestinationSecurityGroupId: !Ref DatabaseSecurityGroup
       Description: 'MySQL/Aurora to database'
 
+  # Egress: Private Instance → Database (PostgreSQL)
   PrivateInstanceToDatabaseEgressPostgres:
     Type: AWS::EC2::SecurityGroupEgress
     Properties:
@@ -280,6 +421,7 @@ Resources:
       DestinationSecurityGroupId: !Ref DatabaseSecurityGroup
       Description: 'PostgreSQL to database'
 
+  # Egress: Private Instance → Cache (Redis)
   PrivateInstanceToCacheEgressRedis:
     Type: AWS::EC2::SecurityGroupEgress
     Properties:
@@ -290,6 +432,7 @@ Resources:
       DestinationSecurityGroupId: !Ref CacheSecurityGroup
       Description: 'Redis to cache'
 
+  # Egress: Private Instance → EFS
   PrivateInstanceToEFSEgress:
     Type: AWS::EC2::SecurityGroupEgress
     Properties:
@@ -301,7 +444,9 @@ Resources:
       Description: 'NFS to EFS'
 
   # ============================================================================
-  # Database Security Group (RDS/Aurora)
+  # Database Security Group
+  # Purpose: Accept database connections from application tiers
+  # Used by: RDS MySQL, RDS PostgreSQL, Aurora
   # ============================================================================
   DatabaseSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -343,7 +488,9 @@ Resources:
           Value: 'CloudFormation'
 
   # ============================================================================
-  # ElastiCache Security Group (Redis/Memcached)
+  # ElastiCache Security Group
+  # Purpose: Accept cache connections from application tiers
+  # Used by: ElastiCache Redis, ElastiCache Memcached
   # ============================================================================
   CacheSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -386,6 +533,8 @@ Resources:
 
   # ============================================================================
   # EFS Security Group
+  # Purpose: Accept NFS connections from application tiers
+  # Used by: EFS mount targets
   # ============================================================================
   EFSSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -417,7 +566,9 @@ Resources:
           Value: 'CloudFormation'
 
   # ============================================================================
-  # Lambda Security Group (for VPC-enabled Lambda functions)
+  # Lambda Security Group
+  # Purpose: Allow Lambda to access databases, cache, and AWS services
+  # Used by: VPC-enabled Lambda functions
   # ============================================================================
   LambdaSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -454,6 +605,7 @@ Resources:
         - Key: ManagedBy
           Value: 'CloudFormation'
 
+  # Egress: Lambda → VPC Endpoints
   LambdaToVPCEndpointEgress:
     Type: AWS::EC2::SecurityGroupEgress
     Properties:
@@ -464,6 +616,7 @@ Resources:
       DestinationSecurityGroupId: !Ref VPCEndpointSecurityGroup
       Description: 'HTTPS to VPC endpoints'
 
+  # Ingress: Database ← Lambda (MySQL)
   DatabaseFromLambdaIngressMySQL:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
@@ -474,6 +627,7 @@ Resources:
       SourceSecurityGroupId: !Ref LambdaSecurityGroup
       Description: 'MySQL/Aurora from Lambda'
 
+  # Ingress: Database ← Lambda (PostgreSQL)
   DatabaseFromLambdaIngressPostgres:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
@@ -484,6 +638,7 @@ Resources:
       SourceSecurityGroupId: !Ref LambdaSecurityGroup
       Description: 'PostgreSQL from Lambda'
 
+  # Ingress: Cache ← Lambda (Redis)
   CacheFromLambdaIngressRedis:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
@@ -498,53 +653,35 @@ Outputs:
   VPCEndpointSecurityGroupId:
     Description: 'Security Group ID for VPC Endpoints'
     Value: !Ref VPCEndpointSecurityGroup
-    Export:
-      Name: !Sub '${AWS::StackName}-VPCEndpoint-SG'
 
   EICEndpointSecurityGroupId:
     Description: 'Security Group ID for EC2 Instance Connect Endpoint'
     Value: !Ref EICEndpointSecurityGroup
-    Export:
-      Name: !Sub '${AWS::StackName}-EIC-Endpoint-SG'
 
   LoadBalancerSecurityGroupId:
     Description: 'Security Group ID for Load Balancer'
     Value: !Ref LoadBalancerSecurityGroup
-    Export:
-      Name: !Sub '${AWS::StackName}-LoadBalancer-SG'
 
   WebInstanceSecurityGroupId:
     Description: 'Security Group ID for Web/Application Instances'
     Value: !Ref WebInstanceSecurityGroup
-    Export:
-      Name: !Sub '${AWS::StackName}-WebInstance-SG'
 
   PrivateInstanceSecurityGroupId:
     Description: 'Security Group ID for Private Instances'
     Value: !Ref PrivateInstanceSecurityGroup
-    Export:
-      Name: !Sub '${AWS::StackName}-PrivateInstance-SG'
 
   DatabaseSecurityGroupId:
     Description: 'Security Group ID for Database'
     Value: !Ref DatabaseSecurityGroup
-    Export:
-      Name: !Sub '${AWS::StackName}-Database-SG'
 
   CacheSecurityGroupId:
     Description: 'Security Group ID for ElastiCache'
     Value: !Ref CacheSecurityGroup
-    Export:
-      Name: !Sub '${AWS::StackName}-Cache-SG'
 
   EFSSecurityGroupId:
     Description: 'Security Group ID for EFS'
     Value: !Ref EFSSecurityGroup
-    Export:
-      Name: !Sub '${AWS::StackName}-EFS-SG'
 
   LambdaSecurityGroupId:
     Description: 'Security Group ID for Lambda Functions'
     Value: !Ref LambdaSecurityGroup
-    Export:
-      Name: !Sub '${AWS::StackName}-Lambda-SG'
