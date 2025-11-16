@@ -124,8 +124,10 @@ Resources:
                 Action:
                   - lambda:UpdateFunctionCode
                   - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
                   - lambda:PublishVersion
                   - lambda:GetAlias
+                  - lambda:UpdateAlias
                 Resource: !Sub '${CalculatorFunction.Arn}*'
 
   CodePipelineRole:
@@ -220,22 +222,16 @@ Resources:
                   bin1 = event.get('binary1', '0')
                   bin2 = event.get('binary2', '0')
 
-                  # Convert binary to decimal
                   num1 = int(bin1, 2)
                   num2 = int(bin2, 2)
-
-                  # Add
                   result = num1 + num2
-
-                  # Convert back to binary
-                  result_binary = bin(result)[2:]
 
                   return {
                       'statusCode': 200,
                       'body': {
                           'input1': bin1,
                           'input2': bin2,
-                          'result': result_binary,
+                          'result': bin(result)[2:],
                           'decimal': result
                       }
                   }
@@ -280,7 +276,7 @@ Resources:
               lifecycle_id = event['LifecycleEventHookExecutionId']
 
               try:
-                  # Test 1: Basic addition
+                  # Test: 101 (5) + 11 (3) = 1000 (8)
                   result = lambda_client.invoke(
                       FunctionName='binary-calc-calculator:live',
                       Payload=json.dumps({
@@ -292,11 +288,11 @@ Resources:
                   response = json.loads(result['Payload'].read())
 
                   if response['statusCode'] != 200:
-                      raise Exception('Test failed: Invalid status code')
+                      raise Exception('Invalid status code')
 
                   body = response['body']
-                  if body['result'] != '1000':  # 5 + 3 = 8 = 1000 in binary
-                      raise Exception(f"Test failed: Expected 1000, got {body['result']}")
+                  if body['result'] != '1000':
+                      raise Exception(f"Expected 1000, got {body['result']}")
 
                   print("✓ All tests passed")
                   status = 'Succeeded'
@@ -381,30 +377,29 @@ Resources:
               commands:
                 - echo "Building deployment package..."
                 - zip -j function.zip index.py
-
                 - echo "Updating Lambda function..."
                 - aws lambda update-function-code --function-name $FUNCTION_NAME --zip-file fileb://function.zip
+                - echo "Waiting for function update..."
                 - aws lambda wait function-updated --function-name $FUNCTION_NAME
-
                 - echo "Publishing new version..."
                 - NEW_VERSION=$(aws lambda publish-version --function-name $FUNCTION_NAME --query 'Version' --output text)
+                - echo "New version is $NEW_VERSION"
+                - echo "Getting current version..."
                 - CURRENT_VERSION=$(aws lambda get-alias --function-name $FUNCTION_NAME --name live --query 'FunctionVersion' --output text)
-
-                - echo "Creating AppSpec..."
-                - |
-                  cat > appspec.yaml <<EOF
-                  version: 0.0
-                  Resources:
-                    - ${FUNCTION_NAME}:
-                        Type: AWS::Lambda::Function
-                        Properties:
-                          Name: "${FUNCTION_NAME}"
-                          Alias: "live"
-                          CurrentVersion: "${CURRENT_VERSION}"
-                          TargetVersion: "${NEW_VERSION}"
-                  Hooks:
-                    - BeforeAllowTraffic: "binary-calc-validation"
-                  EOF
+                - echo "Current version is $CURRENT_VERSION"
+                - echo "Creating AppSpec file..."
+                - echo "version 0.0" > appspec.yaml
+                - echo "Resources:" >> appspec.yaml
+                - echo "  - ${FUNCTION_NAME}:" >> appspec.yaml
+                - echo "      Type AWS::Lambda::Function" >> appspec.yaml
+                - echo "      Properties:" >> appspec.yaml
+                - echo "        Name \"${FUNCTION_NAME}\"" >> appspec.yaml
+                - echo "        Alias \"live\"" >> appspec.yaml
+                - echo "        CurrentVersion \"${CURRENT_VERSION}\"" >> appspec.yaml
+                - echo "        TargetVersion \"${NEW_VERSION}\"" >> appspec.yaml
+                - echo "Hooks:" >> appspec.yaml
+                - echo "  - BeforeAllowTraffic \"binary-calc-validation\"" >> appspec.yaml
+                - echo "AppSpec contents:"
                 - cat appspec.yaml
           artifacts:
             files:
