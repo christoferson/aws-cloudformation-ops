@@ -1,5 +1,78 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'VPC Endpoints for AWS Systems Manager Session Manager and EC2 Instance Connect'
+Description: |
+  VPC Endpoints for Private AWS Service Access
+
+  Purpose:
+    Creates VPC endpoints to enable private connectivity to AWS services without requiring
+    an Internet Gateway or NAT Gateway. This allows EC2 instances in private subnets to
+    access AWS services securely through AWS PrivateLink.
+
+  VPC Endpoints Created:
+
+    1. SSM Endpoint (com.amazonaws.REGION.ssm)
+       Type: Interface Endpoint
+       Purpose: AWS Systems Manager API operations
+       Port: 443 (HTTPS)
+       Private DNS: Enabled
+       Required for: Systems Manager Session Manager, Parameter Store, Run Command
+       Cost: ~$7.20/month + $0.01/GB data processed
+
+    2. SSM Messages Endpoint (com.amazonaws.REGION.ssmmessages)
+       Type: Interface Endpoint
+       Purpose: Session Manager message routing
+       Port: 443 (HTTPS)
+       Private DNS: Enabled
+       Required for: Session Manager console and CLI connections
+       Cost: ~$7.20/month + $0.01/GB data processed
+
+    3. EC2 Messages Endpoint (com.amazonaws.REGION.ec2messages)
+       Type: Interface Endpoint
+       Purpose: EC2 instance communication with Systems Manager
+       Port: 443 (HTTPS)
+       Private DNS: Enabled
+       Required for: SSM Agent to communicate with Systems Manager service
+       Cost: ~$7.20/month + $0.01/GB data processed
+
+    4. EC2 Instance Connect Endpoint
+       Type: EC2 Instance Connect Endpoint (not a VPC Endpoint)
+       Purpose: SSH access to EC2 instances without public IPs or bastion hosts
+       Port: 22 (SSH)
+       Required for: Browser-based SSH and AWS CLI SSH connections
+       Cost: ~$0.01/hour (~$7.20/month) + $0.01/GB data processed
+       Limitation: One endpoint per subnet, but can reach instances in any subnet
+
+  Network Architecture:
+    - All Interface Endpoints deployed across multiple AZs for high availability
+    - Private DNS enabled for seamless service access (no code changes required)
+    - EIC Endpoint deployed in single subnet (can reach instances in any subnet)
+
+  Security:
+    - All endpoints protected by security groups
+    - Interface Endpoints: Allow TCP 443 from VPC CIDR
+    - EIC Endpoint: Allow TCP 22 egress to VPC CIDR
+    - No public IP addresses assigned
+    - Traffic never leaves AWS network
+
+  Cost Estimate (us-east-1):
+    - 3 Interface Endpoints: 3 × $7.20 = $21.60/month
+    - 1 EIC Endpoint: $7.20/month
+    - Data Processing: $0.01/GB (all endpoints)
+    - Total Base Cost: ~$28.80/month + data transfer
+
+  Prerequisites:
+    - VPC with private subnets
+    - Security groups for VPC endpoints and EIC endpoint
+    - Instances must have IAM role with SSM permissions (AmazonSSMManagedInstanceCore)
+
+  Session Manager Requirements:
+    All three SSM endpoints are required for Session Manager to work:
+    - ssm: For API calls to start/terminate sessions
+    - ssmmessages: For session data channel
+    - ec2messages: For SSM Agent communication
+
+  Traffic Flow:
+    EC2 Instance → VPC Endpoint Security Group (443) → SSM/SSMMessages/EC2Messages Endpoints
+    AWS Console/CLI → EIC Endpoint → Instance Security Group (22) → EC2 Instance
 
 Parameters:
   VpcId:
@@ -12,11 +85,11 @@ Parameters:
 
   VPCEndpointSecurityGroupId:
     Type: AWS::EC2::SecurityGroup::Id
-    Description: 'Security Group ID for SSM VPC Endpoints'
+    Description: 'Security Group ID for SSM VPC Endpoints (must allow TCP 443 ingress from VPC CIDR)'
 
   EICEndpointSecurityGroupId:
     Type: AWS::EC2::SecurityGroup::Id
-    Description: 'Security Group ID for EC2 Instance Connect Endpoint'
+    Description: 'Security Group ID for EC2 Instance Connect Endpoint (must allow TCP 22 egress to VPC CIDR)'
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -42,7 +115,17 @@ Metadata:
         default: 'EIC Endpoint Security Group ID'
 
 Resources:
+  # ============================================================================
   # SSM VPC Endpoint
+  # Service: com.amazonaws.REGION.ssm
+  # Purpose: AWS Systems Manager API operations (start/stop sessions, parameter store)
+  # Port: TCP 443 (HTTPS)
+  # Type: Interface Endpoint (creates ENI in each subnet)
+  # Private DNS: Enabled (ssm.REGION.amazonaws.com resolves to private IPs)
+  # Required for: Session Manager, Run Command, Parameter Store, Patch Manager
+  # Security: Requires ingress rule allowing TCP 443 from VPC CIDR
+  # Cost: ~$7.20/month + $0.01/GB data processed
+  # ============================================================================
   SSMEndpoint:
     Type: AWS::EC2::VPCEndpoint
     Properties:
@@ -61,7 +144,18 @@ Resources:
         - Key: ManagedBy
           Value: 'CloudFormation'
 
+  # ============================================================================
   # SSM Messages VPC Endpoint
+  # Service: com.amazonaws.REGION.ssmmessages
+  # Purpose: Session Manager message routing and bidirectional communication channel
+  # Port: TCP 443 (HTTPS)
+  # Type: Interface Endpoint
+  # Private DNS: Enabled (ssmmessages.REGION.amazonaws.com resolves to private IPs)
+  # Required for: Session Manager console and CLI connections, interactive shell sessions
+  # Security: Requires ingress rule allowing TCP 443 from VPC CIDR
+  # Cost: ~$7.20/month + $0.01/GB data processed
+  # Note: This endpoint handles the actual session data (keystrokes, output)
+  # ============================================================================
   SSMMessagesEndpoint:
     Type: AWS::EC2::VPCEndpoint
     Properties:
@@ -80,7 +174,18 @@ Resources:
         - Key: ManagedBy
           Value: 'CloudFormation'
 
+  # ============================================================================
   # EC2 Messages VPC Endpoint
+  # Service: com.amazonaws.REGION.ec2messages
+  # Purpose: SSM Agent communication with Systems Manager service
+  # Port: TCP 443 (HTTPS)
+  # Type: Interface Endpoint
+  # Private DNS: Enabled (ec2messages.REGION.amazonaws.com resolves to private IPs)
+  # Required for: SSM Agent to send status updates, receive commands, report health
+  # Security: Requires ingress rule allowing TCP 443 from VPC CIDR
+  # Cost: ~$7.20/month + $0.01/GB data processed
+  # Note: SSM Agent polls this endpoint for pending commands and sends execution results
+  # ============================================================================
   EC2MessagesEndpoint:
     Type: AWS::EC2::VPCEndpoint
     Properties:
@@ -99,7 +204,30 @@ Resources:
         - Key: ManagedBy
           Value: 'CloudFormation'
 
-  # EC2 Instance Connect Endpoint (uses first subnet from SubnetIds)
+  # ============================================================================
+  # EC2 Instance Connect Endpoint
+  # Service: AWS EC2 Instance Connect (not a VPC Endpoint, different service)
+  # Purpose: SSH access to EC2 instances without public IPs, bastion hosts, or SSH keys
+  # Port: TCP 22 (SSH)
+  # Type: Managed network interface in specified subnet
+  # Deployment: Single subnet (first subnet from SubnetIds parameter)
+  # Reach: Can connect to instances in ANY subnet within the VPC
+  # Access Methods:
+  #   - AWS Console: EC2 → Connect → EC2 Instance Connect
+  #   - AWS CLI: aws ec2-instance-connect ssh --instance-id <id>
+  # Security: 
+  #   - EIC Endpoint SG must allow TCP 22 egress to target instances
+  #   - Target instance SG must allow TCP 22 ingress from EIC Endpoint SG
+  # Cost: ~$0.01/hour (~$7.20/month) + $0.01/GB data processed
+  # Limitations:
+  #   - One endpoint per subnet (but can reach instances in other subnets)
+  #   - PreserveClientIp=false means instances see EIC endpoint IP, not your IP
+  # Benefits:
+  #   - No SSH key management required
+  #   - No bastion host to maintain
+  #   - IAM-based access control
+  #   - Audit trail in CloudTrail
+  # ============================================================================
   EC2InstanceConnectEndpoint:
     Type: AWS::EC2::InstanceConnectEndpoint
     Properties:
@@ -116,66 +244,105 @@ Resources:
           Value: 'CloudFormation'
 
 Outputs:
+  # ============================================================================
+  # VPC Endpoint IDs
+  # ============================================================================
   SSMEndpointId:
-    Description: 'SSM VPC Endpoint ID'
+    Description: 'SSM VPC Endpoint ID (com.amazonaws.REGION.ssm)'
     Value: !Ref SSMEndpoint
-    Export:
-      Name: !Sub '${AWS::StackName}-SSMEndpointId'
 
   SSMMessagesEndpointId:
-    Description: 'SSM Messages VPC Endpoint ID'
+    Description: 'SSM Messages VPC Endpoint ID (com.amazonaws.REGION.ssmmessages)'
     Value: !Ref SSMMessagesEndpoint
-    Export:
-      Name: !Sub '${AWS::StackName}-SSMMessagesEndpointId'
 
   EC2MessagesEndpointId:
-    Description: 'EC2 Messages VPC Endpoint ID'
+    Description: 'EC2 Messages VPC Endpoint ID (com.amazonaws.REGION.ec2messages)'
     Value: !Ref EC2MessagesEndpoint
-    Export:
-      Name: !Sub '${AWS::StackName}-EC2MessagesEndpointId'
 
   EC2InstanceConnectEndpointId:
     Description: 'EC2 Instance Connect Endpoint ID'
     Value: !Ref EC2InstanceConnectEndpoint
-    Export:
-      Name: !Sub '${AWS::StackName}-EICEndpointId'
 
+  # ============================================================================
+  # Network Information
+  # ============================================================================
   EC2InstanceConnectEndpointSubnet:
-    Description: 'Subnet where EIC Endpoint was created'
+    Description: 'Subnet where EIC Endpoint was created (first subnet from SubnetIds)'
     Value: !Select [0, !Ref SubnetIds]
-    Export:
-      Name: !Sub '${AWS::StackName}-EICEndpointSubnet'
 
+  # ============================================================================
+  # DNS Information
+  # Private DNS enabled - service endpoints resolve to private IPs in your VPC
+  # ============================================================================
   SSMEndpointDNS:
-    Description: 'SSM Endpoint DNS names'
+    Description: 'SSM Endpoint DNS names (ssm.REGION.amazonaws.com resolves to these private IPs)'
     Value: !Join [', ', !GetAtt SSMEndpoint.DnsEntries]
 
   SSMMessagesEndpointDNS:
-    Description: 'SSM Messages Endpoint DNS names'
+    Description: 'SSM Messages Endpoint DNS names (ssmmessages.REGION.amazonaws.com resolves to these private IPs)'
     Value: !Join [', ', !GetAtt SSMMessagesEndpoint.DnsEntries]
 
   EC2MessagesEndpointDNS:
-    Description: 'EC2 Messages Endpoint DNS names'
+    Description: 'EC2 Messages Endpoint DNS names (ec2messages.REGION.amazonaws.com resolves to these private IPs)'
     Value: !Join [', ', !GetAtt EC2MessagesEndpoint.DnsEntries]
 
+  # ============================================================================
+  # Security Group Information
+  # ============================================================================
   VPCEndpointSecurityGroupUsed:
-    Description: 'Security Group ID used for VPC Endpoints'
+    Description: 'Security Group ID used for VPC Endpoints (must allow TCP 443 from VPC CIDR)'
     Value: !Ref VPCEndpointSecurityGroupId
 
   EICEndpointSecurityGroupUsed:
-    Description: 'Security Group ID used for EIC Endpoint'
+    Description: 'Security Group ID used for EIC Endpoint (must allow TCP 22 to VPC CIDR)'
     Value: !Ref EICEndpointSecurityGroupId
 
+  # ============================================================================
+  # Usage Information
+  # ============================================================================
   StackInfo:
-    Description: 'Stack information'
+    Description: 'VPC Endpoints deployment summary and usage instructions'
     Value: !Sub |
       VPC Endpoints created successfully in VPC ${VpcId}
 
-      SSM Endpoints:
-      - Private DNS is enabled for all SSM endpoints
-      - Using security group: ${VPCEndpointSecurityGroupId}
+      SSM Endpoints (all three required for Session Manager):
+      - SSM: ${SSMEndpoint}
+      - SSM Messages: ${SSMMessagesEndpoint}
+      - EC2 Messages: ${EC2MessagesEndpoint}
+      - Private DNS: Enabled (service endpoints resolve to private IPs)
+      - Security Group: ${VPCEndpointSecurityGroupId}
+      - Subnets: ${SubnetIds}
 
       EC2 Instance Connect Endpoint:
-      - Created in first subnet from SubnetIds list
-      - Using security group: ${EICEndpointSecurityGroupId}
-      - Note: Only one EIC endpoint allowed per subnet
+      - Endpoint ID: ${EC2InstanceConnectEndpoint}
+      - Subnet: ${SubnetIds[0]}
+      - Security Group: ${EICEndpointSecurityGroupId}
+      - Limitation: One endpoint per subnet
+      - Reach: Can connect to instances in any subnet within VPC
+
+      How to Connect to EC2 Instances:
+
+      1. Session Manager (via SSM endpoints):
+         Console: Systems Manager → Session Manager → Start session
+         CLI: aws ssm start-session --target <instance-id>
+         Requirements:
+           - Instance has IAM role with AmazonSSMManagedInstanceCore policy
+           - Instance security group allows TCP 443 to VPC Endpoint SG
+           - SSM Agent running on instance (pre-installed on Amazon Linux 2023)
+
+      2. EC2 Instance Connect (via EIC endpoint):
+         Console: EC2 → Select instance → Connect → EC2 Instance Connect
+         CLI: aws ec2-instance-connect ssh --instance-id <instance-id>
+         Requirements:
+           - Instance security group allows TCP 22 from EIC Endpoint SG
+           - No SSH keys required
+
+      Verification:
+      - Check endpoint status: aws ec2 describe-vpc-endpoints --vpc-endpoint-ids ${SSMEndpoint}
+      - Test DNS resolution: nslookup ssm.${AWS::Region}.amazonaws.com
+      - Should resolve to private IPs in VPC CIDR range
+
+      Cost (us-east-1):
+      - 3 Interface Endpoints: $21.60/month + $0.01/GB
+      - 1 EIC Endpoint: $7.20/month + $0.01/GB
+      - Total: ~$28.80/month + data transfer
