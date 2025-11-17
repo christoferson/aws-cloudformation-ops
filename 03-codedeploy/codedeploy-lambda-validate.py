@@ -185,7 +185,7 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRoleForLambda
       Policies:
-        - PolicyName: CodeDeployS3Access
+        - PolicyName: CodeDeployAdditionalPermissions
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
@@ -194,6 +194,16 @@ Resources:
                   - s3:GetObject
                   - s3:GetObjectVersion
                 Resource: !Sub '${PipelineArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:GetAlias
+                  - lambda:UpdateAlias
+                  - lambda:InvokeFunction
+                Resource: 
+                  - !Sub '${CalculatorFunction.Arn}*'
+                  - !Sub '${ValidationFunction.Arn}*'
 
   EventBridgeRole:
     Type: AWS::IAM::Role
