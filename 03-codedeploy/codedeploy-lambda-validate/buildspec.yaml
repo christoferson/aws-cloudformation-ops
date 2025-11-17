@@ -1,0 +1,24 @@
+version: 0.2
+phases:
+  build:
+    commands:
+      - echo "Building deployment package..."
+      - zip -j function.zip index.py
+      - echo "Updating Lambda function..."
+      - aws lambda update-function-code --function-name $FUNCTION_NAME --zip-file fileb://function.zip
+      - echo "Waiting for function update..."
+      - aws lambda wait function-updated --function-name $FUNCTION_NAME
+      - echo "Publishing new version..."
+      - NEW_VERSION=$(aws lambda publish-version --function-name $FUNCTION_NAME --query 'Version' --output text)
+      - echo "New version is $NEW_VERSION"
+      - echo "Getting current version..."
+      - CURRENT_VERSION=$(aws lambda get-alias --function-name $FUNCTION_NAME --name live --query 'FunctionVersion' --output text)
+      - echo "Current version is $CURRENT_VERSION"
+      - echo "Updating appspec.yaml with versions..."
+      - sed -i "s/CurrentVersion:.*/CurrentVersion: \"$CURRENT_VERSION\"/" appspec.yaml
+      - sed -i "s/TargetVersion:.*/TargetVersion: \"$NEW_VERSION\"/" appspec.yaml
+      - echo "Final AppSpec contents:"
+      - cat appspec.yaml
+artifacts:
+  files:
+    - appspec.yaml
