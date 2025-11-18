@@ -15,8 +15,8 @@ phases:
       - CURRENT_VERSION=$(aws lambda get-alias --function-name $FUNCTION_NAME --name live --query 'FunctionVersion' --output text)
       - echo "Current version is $CURRENT_VERSION"
       - echo "Updating appspec.yaml with versions..."
-      - sed -i "s/CurrentVersion:.*/CurrentVersion: \"$CURRENT_VERSION\"/" appspec.yaml
-      - sed -i "s/TargetVersion:.*/TargetVersion: \"$NEW_VERSION\"/" appspec.yaml
+      - sed -i "s/CurrentVersion:.*/CurrentVersion:\ \"$CURRENT_VERSION\"/" appspec.yaml
+      - sed -i "s/TargetVersion:.*/TargetVersion:\ \"$NEW_VERSION\"/" appspec.yaml
       - echo "Final AppSpec contents:"
       - cat appspec.yaml
 artifacts:
