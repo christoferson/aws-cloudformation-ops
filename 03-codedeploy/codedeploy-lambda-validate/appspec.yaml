@@ -1,0 +1,11 @@
+version: 0.0
+Resources:
+  - binary-calc-calculator:
+      Type: AWS::Lambda::Function
+      Properties:
+        Name: "binary-calc-calculator"
+        Alias: "live"
+        CurrentVersion: "1"
+        TargetVersion: "2"
+Hooks:
+  - BeforeAllowTraffic: "binary-calc-validation"
