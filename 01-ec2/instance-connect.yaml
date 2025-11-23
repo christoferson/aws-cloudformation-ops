@@ -1,11 +1,105 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'EC2 instance with SSM Session Manager and EC2 Instance Connect enabled'
+Description: |
+  EC2 Instance with Private Connectivity (No Public IP)
+
+  Purpose:
+    Creates an EC2 instance in a private subnet with secure access via AWS managed services.
+    No public IP address, no SSH keys required, no bastion host needed.
+
+  Access Methods:
+
+    1. AWS Systems Manager Session Manager
+       - Browser-based shell access via AWS Console
+       - CLI access via: aws ssm start-session --target <instance-id>
+       - No SSH keys required
+       - Full audit trail in CloudTrail
+       - Requires: SSM, SSMMessages, EC2Messages VPC endpoints
+       - IAM-based access control
+
+    2. EC2 Instance Connect
+       - Browser-based SSH via AWS Console
+       - CLI access via: aws ec2-instance-connect ssh --instance-id <instance-id>
+       - No SSH keys required
+       - Temporary SSH key injected by AWS
+       - Requires: EC2 Instance Connect Endpoint
+       - IAM-based access control
+
+  Instance Configuration:
+    - OS: Amazon Linux 2023 (latest AMI via SSM Parameter)
+    - Instance Type: t3.micro (configurable)
+    - Storage: 20 GB gp3 EBS volume (encrypted, configurable)
+    - Network: Private subnet only, no public IP
+    - Monitoring: CloudWatch detailed monitoring enabled
+    - Metadata: IMDSv2 required (enhanced security)
+
+  Security Features:
+    - No public IP address
+    - No SSH keys stored or managed
+    - Encrypted EBS volume
+    - IMDSv2 enforced (prevents SSRF attacks)
+    - Security group with least privilege rules
+    - IAM role with minimal required permissions
+
+  IAM Permissions:
+    - AmazonSSMManagedInstanceCore: Session Manager, Run Command, Patch Manager
+    - CloudWatchAgentServerPolicy: Send metrics and logs to CloudWatch
+
+  Network Requirements:
+    - Private subnet (no route to Internet Gateway)
+    - VPC Endpoints: SSM, SSMMessages, EC2Messages (for Session Manager)
+    - VPC Endpoint: CloudWatch Logs (for logging)
+    - S3 Gateway Endpoint (for package updates via yum/dnf)
+    - EC2 Instance Connect Endpoint (for SSH access)
+
+  Security Group Rules:
+    Ingress:
+      - TCP 22 from EIC Endpoint Security Group (SSH via Instance Connect)
+    Egress:
+      - TCP 443 to VPC Endpoint Security Group (SSM, CloudWatch)
+      - TCP 443 to 0.0.0.0/0 (AWS APIs via VPC endpoints)
+      - TCP 80 to 0.0.0.0/0 (package updates via S3 endpoint)
+
+  User Data Actions:
+    1. Update all packages (dnf update -y)
+    2. Install CloudWatch agent
+    3. Enable and start SSM agent (pre-installed on AL2023)
+    4. Enable and start SSH daemon
+    5. Log all actions to /var/log/user-data.log
+
+  Cost Estimate (us-east-1):
+    - t3.micro instance: ~$7.50/month (730 hours)
+    - 20 GB gp3 storage: ~$1.60/month
+    - CloudWatch detailed monitoring: ~$2.10/month
+    - Total: ~$11.20/month
+    - Note: VPC endpoint costs are separate (see vpc-endpoints template)
+
+  High Availability Considerations:
+    - Single instance (not HA by default)
+    - For HA: Use Auto Scaling Group with multiple AZs
+    - For HA: Deploy VPC endpoints in multiple AZs
+    - For HA: Use Application Load Balancer
+
+  Monitoring:
+    - CloudWatch detailed monitoring enabled
+    - CloudWatch Logs group created (7-day retention)
+    - User data logs: /var/log/user-data.log
+    - SSM Agent logs: /var/log/amazon/ssm/
+
+  Prerequisites:
+    - VPC with private subnets
+    - VPC Endpoints deployed (SSM, SSMMessages, EC2Messages)
+    - S3 Gateway Endpoint (for package updates)
+    - EC2 Instance Connect Endpoint
+    - Security groups for VPC endpoints and EIC endpoint
 
 Parameters:
+  # ============================================================================
+  # Instance Configuration
+  # ============================================================================
   LatestAmiId:
     Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
     Default: '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64'
-    Description: 'Latest Amazon Linux 2023 AMI ID from SSM Parameter Store'
+    Description: 'Latest Amazon Linux 2023 AMI ID from SSM Parameter Store (automatically updated)'
 
   InstanceType:
     Type: String
@@ -15,26 +109,32 @@ Parameters:
       - t3.small
       - t3.medium
       - t3.large
-    Description: 'EC2 instance type'
+    Description: 'EC2 instance type (t3.micro = 2 vCPU, 1 GB RAM, ~$7.50/month)'
 
   VolumeSize:
     Type: Number
     Default: 20
     MinValue: 8
     MaxValue: 100
-    Description: 'EBS volume size in GB'
+    Description: 'EBS root volume size in GB (gp3, encrypted, ~$0.08/GB/month)'
 
+  # ============================================================================
+  # Network Configuration
+  # ============================================================================
   VpcId:
     Type: AWS::EC2::VPC::Id
     Description: 'VPC ID where the instance will be launched'
 
   SubnetId:
     Type: AWS::EC2::Subnet::Id
-    Description: 'Subnet ID where the instance will be launched'
+    Description: 'Private subnet ID where the instance will be launched (must have route to VPC endpoints)'
 
+  # ============================================================================
+  # Security Group Dependencies
+  # ============================================================================
   EICEndpointSecurityGroupId:
     Type: AWS::EC2::SecurityGroup::Id
-    Description: 'Security Group ID of the EC2 Instance Connect Endpoint'
+    Description: 'Security Group ID of the EC2 Instance Connect Endpoint (for SSH access)'
 
   VPCEndpointSecurityGroupId:
     Type: AWS::EC2::SecurityGroup::Id
@@ -58,6 +158,13 @@ Metadata:
           - VPCEndpointSecurityGroupId
 
 Resources:
+  # ============================================================================
+  # IAM Role for EC2 Instance
+  # Purpose: Grant instance permissions to use SSM and CloudWatch
+  # Policies:
+  #   - AmazonSSMManagedInstanceCore: Session Manager, Run Command, Patch Manager
+  #   - CloudWatchAgentServerPolicy: Send metrics and logs to CloudWatch
+  # ============================================================================
   EC2InstanceRole:
     Type: AWS::IAM::Role
     Properties:
@@ -77,41 +184,67 @@ Resources:
         - Key: ManagedBy
           Value: 'CloudFormation'
 
+  # ============================================================================
+  # Instance Profile
+  # Purpose: Attach IAM role to EC2 instance
+  # Note: Instance profile name can differ from role name
+  # ============================================================================
   EC2InstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
       Roles:
         - !Ref EC2InstanceRole
 
+  # ============================================================================
+  # EC2 Instance Security Group
+  # Purpose: Control network traffic to/from the instance
+  # Ingress:
+  #   - TCP 22 from EIC Endpoint (SSH via Instance Connect)
+  # Egress:
+  #   - TCP 443 to 0.0.0.0/0 (AWS APIs, package updates)
+  #   - TCP 80 to 0.0.0.0/0 (package updates via S3)
+  #   - TCP 443 to VPC Endpoints (SSM, CloudWatch - added separately)
+  # ============================================================================
   EC2SecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupName: !Sub '${AWS::StackName}-EC2-SG'
-      GroupDescription: 'Security group for EC2 instance'
+      GroupDescription: 'Security group for EC2 instance with private connectivity'
       VpcId: !Ref VpcId
       SecurityGroupIngress:
+        # Allow SSH from EC2 Instance Connect Endpoint
         - IpProtocol: tcp
           FromPort: 22
           ToPort: 22
           SourceSecurityGroupId: !Ref EICEndpointSecurityGroupId
           Description: 'SSH from EC2 Instance Connect Endpoint'
       SecurityGroupEgress:
+        # Allow HTTPS for AWS API calls (via VPC endpoints)
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
           CidrIp: 0.0.0.0/0
-          Description: 'HTTPS for AWS services'
+          Description: 'HTTPS for AWS services (via VPC endpoints)'
+        # Allow HTTP for package updates (via S3 Gateway Endpoint)
         - IpProtocol: tcp
           FromPort: 80
           ToPort: 80
           CidrIp: 0.0.0.0/0
-          Description: 'HTTP for package updates'
+          Description: 'HTTP for package updates (yum/dnf via S3 endpoint)'
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-EC2-SG'
         - Key: ManagedBy
           Value: 'CloudFormation'
 
+  # ============================================================================
+  # Security Group Egress Rule: EC2 → VPC Endpoints
+  # Purpose: Explicit rule for HTTPS traffic to VPC endpoints
+  # Destination: VPC Endpoint Security Group
+  # Port: TCP 443 (HTTPS)
+  # Required for: SSM, SSMMessages, EC2Messages, CloudWatch Logs
+  # Note: Separate resource to avoid circular dependency
+  # ============================================================================
   EC2ToVPCEndpointEgress:
     Type: AWS::EC2::SecurityGroupEgress
     Properties:
@@ -120,54 +253,104 @@ Resources:
       FromPort: 443
       ToPort: 443
       DestinationSecurityGroupId: !Ref VPCEndpointSecurityGroupId
-      Description: 'HTTPS to VPC endpoints'
+      Description: 'HTTPS to VPC endpoints (SSM, CloudWatch Logs)'
 
+  # ============================================================================
+  # Launch Template
+  # Purpose: Define instance configuration for consistent deployments
+  # Benefits:
+  #   - Version control for instance configuration
+  #   - Easy updates without recreating instances
+  #   - Can be used with Auto Scaling Groups
+  #   - Supports multiple versions
+  # ============================================================================
   EC2LaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
     Properties:
       LaunchTemplateName: !Sub '${AWS::StackName}-LaunchTemplate'
       LaunchTemplateData:
+        # AMI: Amazon Linux 2023 (latest via SSM Parameter)
         ImageId: !Ref LatestAmiId
+
+        # Instance type: t3.micro (2 vCPU, 1 GB RAM)
         InstanceType: !Ref InstanceType
+
+        # IAM instance profile for SSM and CloudWatch permissions
         IamInstanceProfile:
           Arn: !GetAtt EC2InstanceProfile.Arn
+
+        # Security group for network access control
         SecurityGroupIds:
           - !Ref EC2SecurityGroup
+
+        # EBS volume configuration
         BlockDeviceMappings:
           - DeviceName: /dev/xvda
             Ebs:
               VolumeSize: !Ref VolumeSize
-              VolumeType: gp3
-              Encrypted: true
-              DeleteOnTermination: true
-              Iops: 3000
-              Throughput: 125
+              VolumeType: gp3  # General Purpose SSD (3000 IOPS baseline)
+              Encrypted: true  # Encryption at rest
+              DeleteOnTermination: true  # Delete volume when instance terminates
+              Iops: 3000  # Baseline IOPS for gp3
+              Throughput: 125  # Baseline throughput (MB/s) for gp3
+
+        # Instance Metadata Service v2 (IMDSv2) configuration
+        # HttpTokens: required = Enforce IMDSv2 (prevents SSRF attacks)
+        # HttpPutResponseHopLimit: 1 = Prevent metadata access from containers
+        # HttpEndpoint: enabled = Enable metadata service
+        # InstanceMetadataTags: enabled = Allow access to instance tags via metadata
         MetadataOptions:
           HttpTokens: required
           HttpPutResponseHopLimit: 1
           HttpEndpoint: enabled
           InstanceMetadataTags: enabled
+
+        # Enable detailed CloudWatch monitoring (1-minute intervals)
+        # Cost: ~$2.10/month per instance
         Monitoring:
           Enabled: true
+
+        # User data script: Runs on first boot
+        # Actions:
+        #   1. Update all packages
+        #   2. Install CloudWatch agent
+        #   3. Enable and start SSM agent
+        #   4. Enable and start SSH daemon
+        # Logs: /var/log/user-data.log
         UserData:
           Fn::Base64: !Sub |
             #!/bin/bash
+            # Exit on any error
             set -e
+
+            # Redirect all output to log file and console
             exec > >(tee /var/log/user-data.log)
             exec 2>&1
 
             echo "Starting user data script at $(date)"
 
+            # Update all packages (requires S3 Gateway Endpoint)
+            echo "Updating packages..."
             dnf update -y
+
+            # Install CloudWatch agent for metrics and logs
+            echo "Installing CloudWatch agent..."
             dnf install -y amazon-cloudwatch-agent
 
+            # SSM agent is pre-installed on Amazon Linux 2023
+            # Enable and start it to allow Session Manager access
+            echo "Enabling SSM agent..."
             systemctl enable amazon-ssm-agent
             systemctl start amazon-ssm-agent
 
+            # Enable and start SSH daemon for Instance Connect
+            echo "Enabling SSH daemon..."
             systemctl enable sshd
             systemctl start sshd
 
             echo "Instance initialization completed at $(date)"
+
+        # Tags applied to instance and volumes at launch
         TagSpecifications:
           - ResourceType: instance
             Tags:
@@ -183,6 +366,8 @@ Resources:
                 Value: !Sub '${AWS::StackName}-Volume'
               - Key: ManagedBy
                 Value: 'CloudFormation'
+
+      # Tags for the launch template itself
       TagSpecifications:
         - ResourceType: launch-template
           Tags:
@@ -191,6 +376,12 @@ Resources:
             - Key: ManagedBy
               Value: 'CloudFormation'
 
+  # ============================================================================
+  # EC2 Instance
+  # Purpose: Create the actual EC2 instance using the launch template
+  # Network: Private subnet, no public IP
+  # Access: Session Manager and Instance Connect only
+  # ============================================================================
   EC2Instance:
     Type: AWS::EC2::Instance
     Properties:
@@ -204,6 +395,13 @@ Resources:
         - Key: ManagedBy
           Value: 'CloudFormation'
 
+  # ============================================================================
+  # CloudWatch Log Group
+  # Purpose: Store logs from the instance (application logs, system logs)
+  # Retention: 7 days (configurable)
+  # Cost: $0.50/GB ingested + $0.03/GB stored
+  # Note: Requires CloudWatch Logs VPC endpoint for private instances
+  # ============================================================================
   InstanceLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -216,26 +414,115 @@ Resources:
           Value: 'CloudFormation'
 
 Outputs:
+  # ============================================================================
+  # Instance Information
+  # ============================================================================
   InstanceId:
-    Description: 'EC2 Instance ID'
+    Description: 'EC2 Instance ID (use for SSM and Instance Connect)'
     Value: !Ref EC2Instance
 
   InstancePrivateIP:
-    Description: 'Private IP address of the EC2 instance'
+    Description: 'Private IP address of the EC2 instance (no public IP assigned)'
     Value: !GetAtt EC2Instance.PrivateIp
 
+  InstanceAvailabilityZone:
+    Description: 'Availability Zone where the instance is running'
+    Value: !GetAtt EC2Instance.AvailabilityZone
+
+  # ============================================================================
+  # Security and IAM
+  # ============================================================================
   EC2SecurityGroupId:
-    Description: 'EC2 Instance Security Group ID'
+    Description: 'Security Group ID attached to the instance'
     Value: !Ref EC2SecurityGroup
 
+  IAMRoleArn:
+    Description: 'IAM Role ARN (has SSM and CloudWatch permissions)'
+    Value: !GetAtt EC2InstanceRole.Arn
+
+  InstanceProfileArn:
+    Description: 'Instance Profile ARN attached to the instance'
+    Value: !GetAtt EC2InstanceProfile.Arn
+
+  # ============================================================================
+  # Launch Template
+  # ============================================================================
   LaunchTemplateId:
-    Description: 'Launch Template ID'
+    Description: 'Launch Template ID (can be used for Auto Scaling Groups)'
     Value: !Ref EC2LaunchTemplate
 
+  LaunchTemplateLatestVersion:
+    Description: 'Latest version number of the Launch Template'
+    Value: !GetAtt EC2LaunchTemplate.LatestVersionNumber
+
+  # ============================================================================
+  # Logging
+  # ============================================================================
+  LogGroupName:
+    Description: 'CloudWatch Log Group name for instance logs'
+    Value: !Ref InstanceLogGroup
+
+  # ============================================================================
+  # Console Access URLs
+  # ============================================================================
   SSMConsoleURL:
-    Description: 'Connect via SSM Session Manager'
+    Description: 'AWS Console URL to connect via SSM Session Manager'
     Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/systems-manager/session-manager/${EC2Instance}?region=${AWS::Region}'
 
   EC2ConsoleURL:
-    Description: 'Connect via EC2 Instance Connect'
+    Description: 'AWS Console URL to connect via EC2 Instance Connect'
     Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/ec2/v2/home?region=${AWS::Region}#ConnectToInstance:instanceId=${EC2Instance}'
+
+  # ============================================================================
+  # CLI Commands
+  # ============================================================================
+  SSMConnectCommand:
+    Description: 'AWS CLI command to connect via Session Manager'
+    Value: !Sub 'aws ssm start-session --target ${EC2Instance} --region ${AWS::Region}'
+
+  InstanceConnectCommand:
+    Description: 'AWS CLI command to connect via Instance Connect'
+    Value: !Sub 'aws ec2-instance-connect ssh --instance-id ${EC2Instance} --region ${AWS::Region}'
+
+  # ============================================================================
+  # Connection Instructions
+  # ============================================================================
+  ConnectionInstructions:
+    Description: 'How to connect to this instance'
+    Value: !Sub |
+      Instance ID: ${EC2Instance}
+      Private IP: ${EC2Instance.PrivateIp}
+      Availability Zone: ${EC2Instance.AvailabilityZone}
+
+      This instance has NO public IP address and is only accessible via:
+
+      1. AWS Systems Manager Session Manager (Recommended):
+         Console: ${SSMConsoleURL}
+         CLI: aws ssm start-session --target ${EC2Instance}
+
+         Requirements:
+         - IAM permissions: ssm:StartSession
+         - VPC Endpoints: SSM, SSMMessages, EC2Messages
+         - Instance has SSM agent running (pre-installed on AL2023)
+
+      2. EC2 Instance Connect:
+         Console: ${EC2ConsoleURL}
+         CLI: aws ec2-instance-connect ssh --instance-id ${EC2Instance}
+
+         Requirements:
+         - IAM permissions: ec2-instance-connect:SendSSHPublicKey
+         - EC2 Instance Connect Endpoint in VPC
+         - Instance security group allows TCP 22 from EIC Endpoint SG
+
+      Troubleshooting:
+      - Check SSM agent status: systemctl status amazon-ssm-agent
+      - Check VPC endpoint connectivity: curl -I https://ssm.${AWS::Region}.amazonaws.com
+      - View user data logs: cat /var/log/user-data.log
+      - View SSM agent logs: cat /var/log/amazon/ssm/amazon-ssm-agent.log
+
+      Security:
+      - No SSH keys required for either access method
+      - All access controlled by IAM policies
+      - Full audit trail in CloudTrail
+      - No bastion host needed
+      - No public IP exposure
